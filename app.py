@@ -1,4 +1,5 @@
 import datetime as dt
+import os
 import time
 from pathlib import Path
 
@@ -32,8 +33,19 @@ MAX_DAYS_AHEAD = 365  # 날짜 선택 가능 범위: 오늘 ~ 1년 뒤
 # 자전거 경로: FOSSGIS가 운영하는 공개 OSRM 서버(자전거 프로필). 비상업·소규모 사용용이며 초당 1회 이하로 호출해야 한다.
 ROUTING_BASE = "https://routing.openstreetmap.de/routed-bike"
 ROUTING_USER_AGENT = "ddareungi-esg-demo/1.0"  # 서버 이용 규칙상 앱을 식별하는 값 (연락처를 덧붙이는 것을 권장)
-ROUTING_TIMEOUT_S = 10
-NEAREST_CANDIDATES = 3  # 직선거리 기준 가까운 후보 수 (이 중 자전거 경로가 가장 짧은 곳을 고름)
+ROUTING_TIMEOUT_S = 5
+ROUTING_RETRY_AFTER_S = 300  # 경로 서버 호출이 실패하면 이 시간(초) 동안은 다시 부르지 않고 추정값을 쓴다
+NEAREST_CANDIDATES = 3  # 출발지·도착지마다 보여 줄 가까운 대여소 후보 수
+
+# 4번 메뉴(따릉이 길찾기): 주소 검색은 카카오 로컬 API
+# 키 KAKAO_REST_KEY는 환경변수를 먼저 보고, 없으면 Streamlit secrets(.streamlit/secrets.toml 또는 Cloud Secrets)를 본다.
+KAKAO_BASE = "https://dapi.kakao.com/v2/local/search"
+KAKAO_TIMEOUT_S = 5
+SEOUL_RECT = "126.76,37.41,127.19,37.72"  # 장소 이름 검색 범위: 서울을 감싸는 사각형 (경도,위도,경도,위도)
+MAX_STATION_DIST_M = 2000   # 출발지·도착지에서 이 거리(직선)보다 먼 대여소는 후보에서 뺀다
+WARN_STATION_DIST_M = 1000  # 이 거리보다 멀면 "대여소까지 멀다" 경고
+BIKE_KMH_ESTIMATE = 15.0    # 경로 서버 실패 시 추정용 자전거 평균 속도 (가정값)
+DETOUR_ESTIMATE = 1.3       # 경로 서버 실패 시 직선거리에 곱하는 우회 보정 (가정값)
 
 
 # ==========================================
@@ -216,7 +228,7 @@ def sidebar_station_picker(disabled=False):
         ["전체 대여소"] + sorted(lookup),
         disabled=disabled,
         help="지도(1·2번 메뉴)는 선택한 대여소로 확대되고, 선 그래프(3번 메뉴)는 해당 대여소만 보여주며, "
-             "4번 메뉴는 이 대여소에서 가장 가까운 대여소까지의 경로를 그립니다.",
+             "4번 메뉴(길찾기)에서는 쓰지 않습니다.",
     )
     return None if choice == "전체 대여소" else lookup[choice]
 
@@ -386,17 +398,11 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * r * np.arcsin(np.sqrt(a))
 
 
-def nearest_stations(stations, station_id, k=NEAREST_CANDIDATES):
-    """선택한 대여소와 직선거리 기준으로 가까운 후보 k곳. (선택 대여소, 후보 표) 또는 None."""
-    me_rows = stations[stations["station_id"] == station_id]
-    others = stations[stations["station_id"] != station_id].copy()
-    if me_rows.empty or others.empty:
-        return None
-    me = me_rows.iloc[0]
-    others["straight_m"] = haversine_m(
-        me["lat"], me["lon"], others["lat"].to_numpy(dtype=float), others["lon"].to_numpy(dtype=float)
-    )
-    return me, others.nsmallest(k, "straight_m").reset_index(drop=True)
+def nearest_to_point(stations, lat, lon, k=NEAREST_CANDIDATES, max_m=MAX_STATION_DIST_M):
+    """임의 위치에서 직선거리로 가까운 대여소 k곳 (max_m 이내만). 없으면 빈 표."""
+    out = stations.copy()
+    out["straight_m"] = haversine_m(lat, lon, out["lat"].to_numpy(dtype=float), out["lon"].to_numpy(dtype=float))
+    return out[out["straight_m"] <= max_m].nsmallest(k, "straight_m").reset_index(drop=True)
 
 
 def one_based(df):
@@ -425,38 +431,104 @@ def osrm_get(path, params):
 
 
 @st.cache_data(show_spinner="자전거 경로를 찾는 중입니다...", ttl=24 * 3600)
-def find_bike_route(me_lat, me_lon, candidates):
-    """후보(직선거리 가까운 순) 중 자전거 경로가 가장 짧은 대여소를 고르고 그 경로를 돌려준다.
-    candidates: ((lat, lon), ...). 경로 호출이 실패하면 예외를 던진다(실패 결과가 캐시되지 않도록)."""
-    best = 0
-    if len(candidates) > 1:
-        try:
-            coords = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in [(me_lat, me_lon), *candidates])
-            destinations = ";".join(str(i) for i in range(1, len(candidates) + 1))
-            data = osrm_get(
-                f"table/v1/driving/{coords}",
-                {"sources": "0", "destinations": destinations, "annotations": "distance"},
-            )
-            reachable = [(d, i) for i, d in enumerate(data["distances"][0]) if d is not None]
-            if reachable:
-                best = min(reachable)[1]
-        except Exception:
-            best = 0  # 거리 비교에 실패하면 직선거리 기준 1순위 후보로 진행
-        finally:
-            time.sleep(1.1)  # 공개 서버 이용 규칙: 초당 1회 이하
-
-    lat, lon = candidates[best]
-    data = osrm_get(
-        f"route/v1/driving/{me_lon:.6f},{me_lat:.6f};{lon:.6f},{lat:.6f}",
-        {"overview": "full", "geometries": "geojson"},
-    )
+def bike_route(a_lat, a_lon, b_lat, b_lon):
+    """대여소 → 대여소 자전거 경로. 실패하면 예외를 던진다(실패 결과가 캐시되지 않도록)."""
+    try:
+        data = osrm_get(
+            f"route/v1/driving/{a_lon:.6f},{a_lat:.6f};{b_lon:.6f},{b_lat:.6f}",
+            {"overview": "full", "geometries": "geojson"},
+        )
+    finally:
+        time.sleep(1.1)  # 공개 서버 이용 규칙: 초당 1회 이하
     route = data["routes"][0]
     return {
-        "index": best,
         "distance_m": float(route["distance"]),
         "duration_s": float(route["duration"]),
+        "estimated": False,
         "path": [[la, lo] for lo, la in route["geometry"]["coordinates"]],  # GeoJSON은 (경도, 위도) 순서
     }
+
+
+def bike_leg(a, b):
+    """경로 서버를 먼저 쓰고, 실패하면 직선거리×보정 ÷ 평균속도로 추정한다.
+    실패한 뒤 ROUTING_RETRY_AFTER_S 동안은 서버를 다시 부르지 않아 화면이 느려지지 않게 한다."""
+    if time.time() >= st.session_state.get("routing_down_until", 0):
+        try:
+            return bike_route(a[0], a[1], b[0], b[1])
+        except Exception:
+            st.session_state["routing_down_until"] = time.time() + ROUTING_RETRY_AFTER_S
+    dist = float(haversine_m(a[0], a[1], b[0], b[1])) * DETOUR_ESTIMATE
+    return {"distance_m": dist, "duration_s": dist / (BIKE_KMH_ESTIMATE * 1000 / 3600),
+            "estimated": True, "path": [list(a), list(b)]}
+
+
+def fit_view(points, width_px=600, height_px=480, padding_px=50, max_zoom=17):
+    """점들이 모두 보이는 지도 중심과 확대 단계(웹 메르카토르 기준).
+    width_px는 지도 실제 폭을 알 수 없어 좁은 화면 기준으로 잡은 값이다(넓으면 여유가 더 생길 뿐)."""
+    lats = np.array([p[0] for p in points], dtype=float)
+    lons = np.array([p[1] for p in points], dtype=float)
+    merc = np.log(np.tan(np.pi / 4 + np.radians(lats) / 2))  # 위도 → 메르카토르 y
+    dx = (lons.max() - lons.min()) / 360.0
+    dy = (merc.max() - merc.min()) / (2 * np.pi)
+    zooms = [max_zoom]
+    if dx > 0:
+        zooms.append(np.log2((width_px - 2 * padding_px) / (256 * dx)))
+    if dy > 0:
+        zooms.append(np.log2((height_px - 2 * padding_px) / (256 * dy)))
+    zoom = int(np.clip(np.floor(min(zooms)), 3, max_zoom))
+    center_lat = float(np.degrees(2 * np.arctan(np.exp((merc.max() + merc.min()) / 2)) - np.pi / 2))
+    return [center_lat, float((lons.max() + lons.min()) / 2)], zoom
+
+
+def kakao_key():
+    """환경변수 → Streamlit secrets 순서로 카카오 REST API 키를 찾는다. 없으면 None."""
+    key = os.environ.get("KAKAO_REST_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return str(st.secrets["KAKAO_REST_KEY"]).strip() or None
+    except Exception:  # secrets.toml이 없거나 키가 없음
+        return None
+
+
+@st.cache_data(show_spinner="주소를 찾는 중입니다...", ttl=24 * 3600)
+def kakao_search(query):
+    """장소 이름 → 주소 순으로 검색. 결과 [{name, address, lat, lon}] (최대 5개, 서울 주소 우선).
+    장소 이름은 서울 범위(SEOUL_RECT) 안에서만 찾는다(예: '중앙시장'이 광주로 잡히지 않도록).
+    오류는 requests.HTTPError 등 예외로 던진다(캐시되지 않도록)."""
+    headers = {"Authorization": f"KakaoAK {kakao_key()}"}
+    for kind, extra in (("keyword", {"rect": SEOUL_RECT}), ("address", {})):
+        resp = requests.get(f"{KAKAO_BASE}/{kind}.json", headers=headers,
+                            params={"query": query, "size": 5, **extra}, timeout=KAKAO_TIMEOUT_S)
+        resp.raise_for_status()
+        docs = resp.json().get("documents", [])
+        if docs:
+            docs = sorted(docs, key=lambda d: not d.get("address_name", "").startswith("서울"))  # 서울 먼저(순서 유지)
+            return [{
+                "name": d.get("place_name") or d.get("address_name", query),
+                "address": d.get("road_address_name") or d.get("address_name", ""),
+                "lat": float(d["y"]), "lon": float(d["x"]),  # 카카오는 x=경도, y=위도
+            } for d in docs]
+    return []
+
+
+def station_forecast():
+    """사이드바 조건(모델·날짜·피크 시간대)의 대여소별 예측 상태. (표 또는 None, 안내 문구).
+    예측이 안 돼도 길찾기는 계속되도록 st.stop() 없이 None을 돌려준다."""
+    if missing_files(model_type):
+        return None, "예측 모델·데이터 파일이 없어 재고 예측 상태는 표시하지 않습니다."
+    try:
+        ref_date = pick_reference_date(selected_date, load_slice())
+        if ref_date is None:
+            return None, "참조할 같은 요일 데이터가 없어 재고 예측 상태는 표시하지 않습니다."
+        df_pred, _ = run_prediction(model_type, ref_date, period_label)
+    except Exception:
+        return None, "예측 중 오류가 나서 재고 예측 상태는 표시하지 않습니다."
+    if df_pred is None:
+        return None, "참조일에 해당 시간대 데이터가 없어 재고 예측 상태는 표시하지 않습니다."
+    note = (f"재고 상태는 {selected_date} {period_label} 예측(같은 요일 참조일 {ref_date} 데이터, {model_type}) 기준의 "
+            "참고용 시뮬레이션입니다. 실제 실시간 재고가 아닙니다.")
+    return df_pred.set_index("대여소ID")[["위험상태", "예측_잔여수량", "총거치대수"]], note
 
 
 def hourly_totals(daily, station_id=None):
@@ -494,7 +566,7 @@ selected_date = st.sidebar.date_input(
     max_value=today + dt.timedelta(days=MAX_DAYS_AHEAD),
 )
 period_label = st.sidebar.selectbox("피크 시간대 선택", list(PERIOD_OPTIONS))
-selected_station_id = sidebar_station_picker()
+selected_station_id = sidebar_station_picker(disabled=mode.startswith("4."))
 st.sidebar.caption(
     "선택한 날짜는 아직 실제 데이터가 없으므로, 같은 요일의 가장 최근 실제 데이터(대여·반납 이력, 재고, 기상)를 "
     "모델에 입력해 예측하는 시뮬레이션입니다."
@@ -756,7 +828,7 @@ elif mode == "3. 시간대별 대여·반납 예측 (선 그래프)":
         st.dataframe(hourly.round(1), use_container_width=True)
 
 # ------------------------------------------
-# Mode 4: 가까운 대여소 찾기 (경로 지도)
+# Mode 4: 따릉이 길찾기 (출발지 근처 대여 → 도착지 근처 반납)
 # ------------------------------------------
 elif mode == "4. 가까운 대여소 찾기 (경로 지도)":
     if not find_data_file(STATIONS_FILE).exists():
@@ -764,90 +836,176 @@ elif mode == "4. 가까운 대여소 찾기 (경로 지도)":
         st.stop()
 
     stations = load_station_locations()
-    st.subheader("🧭 선택한 대여소에서 자전거로 가장 가까운 대여소 찾기")
-
-    def add_other_stations(fmap, skip_ids=()):
-        """배경으로 나머지 대여소를 작은 회색 점으로 표시."""
-        for _, r in stations[~stations["station_id"].isin(skip_ids)].iterrows():
-            folium.CircleMarker(
-                location=[r["lat"], r["lon"]],
-                radius=4,
-                color="#8d99ae",
-                fill=True,
-                fill_opacity=0.8,
-                tooltip=f"{r['station_name']} ({r['gu']})",
-            ).add_to(fmap)
-
-    found = None if selected_station_id is None else nearest_stations(stations, selected_station_id)
-
-    if found is None:
-        st.info("사이드바의 '📍 대여소 선택'에서 대여소를 고르면, 자전거로 가장 가까운 대여소까지의 경로가 지도에 표시됩니다.")
-        m5 = folium.Map(location=[stations["lat"].mean(), stations["lon"].mean()], zoom_start=12)
-        add_other_stations(m5)
-        map5_key = "map5_all"
-        route = None
-    else:
-        me, cands = found
-        try:
-            route = find_bike_route(
-                float(me["lat"]),
-                float(me["lon"]),
-                tuple((float(r["lat"]), float(r["lon"])) for _, r in cands.iterrows()),
-            )
-        except Exception:
-            route = None  # 경로 서비스 연결 실패 → 아래에서 직선으로 대체
-
-        if route is not None:
-            near = cands.iloc[route["index"]]
-            path = route["path"]
-            minutes = max(1, round(route["duration_s"] / 60))
-            route_label = f"자전거 경로 약 {fmt_distance(route['distance_m'])}"
-            st.markdown(
-                f"**선택:** {me['station_name']} ({me['gu']}) → "
-                f"**자전거로 가장 가까운 대여소:** {near['station_name']} ({near['gu']}) · "
-                f"{route_label}, 약 **{minutes}분**"
-            )
-            if route["index"] != 0:
-                st.caption(
-                    f"💡 직선거리 기준 최단: {cands.iloc[0]['station_name']} · "
-                    f"자전거 경로 기준 최단: {near['station_name']} (길을 돌아가야 해서 순서가 달라졌습니다)"
-                )
-            line_style = {"color": "#e63946", "weight": 5, "opacity": 0.9}
-        else:
-            near = cands.iloc[0]
-            path = [[me["lat"], me["lon"]], [near["lat"], near["lon"]]]
-            route_label = f"직선거리 약 {fmt_distance(near['straight_m'])}"
-            st.warning("자전거 경로 서비스에 연결하지 못해 직선으로 대신 표시했습니다. 잠시 후 다시 시도해 주세요.")
-            st.markdown(
-                f"**선택:** {me['station_name']} ({me['gu']}) → "
-                f"**가장 가까운 대여소(직선거리):** {near['station_name']} ({near['gu']}) · {route_label}"
-            )
-            line_style = {"color": "#8d99ae", "weight": 4, "dash_array": "8"}
-
-        lats = [pt[0] for pt in path]
-        lons = [pt[1] for pt in path]
-        m5 = folium.Map(location=[(min(lats) + max(lats)) / 2, (min(lons) + max(lons)) / 2], zoom_start=15)
-        m5.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(60, 60))
-        add_other_stations(m5, skip_ids=(me["station_id"], near["station_id"]))
-
-        folium.PolyLine(locations=path, tooltip=route_label, **line_style).add_to(m5)
-        folium.Marker(
-            location=[me["lat"], me["lon"]],
-            tooltip=f"선택: {me['station_name']}",
-            popup=folium.Popup(f"<b>{me['station_name']}</b><br>{me['gu']} (선택한 대여소)", max_width=300),
-            icon=folium.Icon(color="red", icon="star", prefix="glyphicon"),
-        ).add_to(m5)
-        folium.Marker(
-            location=[near["lat"], near["lon"]],
-            tooltip=f"가장 가까운 대여소: {near['station_name']}",
-            popup=folium.Popup(f"<b>{near['station_name']}</b><br>{near['gu']}<br>{route_label}", max_width=300),
-            icon=folium.Icon(color="blue", icon="flag", prefix="glyphicon"),
-        ).add_to(m5)
-        map5_key = f"map5_{selected_station_id}"
-
-    st_folium(m5, width="100%", height=480, returned_objects=[], key=map5_key)
-    if route is not None:
-        st.caption(
-            "경로: © OpenStreetMap contributors (ODbL) · OSRM, routing.openstreetmap.de (FOSSGIS). "
-            "공개 데모 서버를 쓰므로 비상업·소규모 용도로만 사용하세요."
+    st.subheader("🧭 출발지 근처에서 빌려 도착지 근처에 반납하기")
+    st.caption(
+        "출발지·도착지를 장소 이름이나 주소로 검색하면 각각 가장 가까운 대여소를 찾고, "
+        "대여소 사이 **자전거 탑승 예상 시간**을 보여 줍니다. 대상 대여소는 분석용 60곳입니다."
+    )
+    if not kakao_key():
+        st.error(
+            "카카오 API 키(KAKAO_REST_KEY)가 없습니다. 앱을 실행하기 전에 환경변수 `KAKAO_REST_KEY`를 설정하거나, "
+            '`.streamlit/secrets.toml`에 `KAKAO_REST_KEY = "발급받은 REST API 키"`를 넣고 앱을 다시 실행해 주세요.'
         )
+        st.stop()
+
+    # 버튼을 눌렀을 때만 검색 (입력할 때마다 API를 부르지 않도록)
+    with st.form("route_form"):
+        f1, f2 = st.columns(2)
+        q_origin = f1.text_input("출발지", placeholder="예: 서울역, 서울 중구 세종대로 110")
+        q_dest = f2.text_input("도착지", placeholder="예: 광화문")
+        submitted = st.form_submit_button("🔍 대여소 찾기", type="primary")
+    if submitted:
+        st.session_state["route_query"] = (q_origin.strip(), q_dest.strip())
+    q_origin, q_dest = st.session_state.get("route_query", ("", ""))
+    if not q_origin or not q_dest:
+        st.info("출발지와 도착지를 모두 입력하고 '대여소 찾기'를 눌러 주세요.")
+        st.stop()
+
+    def pick_place(label, query, col):
+        """카카오 검색 → 결과가 여러 개면 고르게 한다. 실패하면 이유를 보여 주고 None."""
+        try:
+            results = kakao_search(query)
+        except requests.HTTPError as e:
+            code = getattr(e.response, "status_code", None)
+            if code in (401, 403):
+                col.error(
+                    f"카카오 API 키가 올바르지 않거나 사용 권한이 없습니다(오류 {code}). "
+                    "secrets.toml의 키와 카카오 개발자 사이트의 앱 설정을 확인해 주세요."
+                )
+            else:
+                col.warning(f"'{query}' 검색에 실패했습니다(오류 {code}). 잠시 후 다시 시도해 주세요.")
+            return None
+        except Exception:
+            col.warning(f"'{query}' 검색 중 카카오 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.")
+            return None
+        if not results:
+            col.warning(f"'{query}' 검색 결과가 없습니다. 다른 이름이나 주소로 검색해 주세요.")
+            return None
+        labels = [f"{r['name']} · {r['address']}" if r["address"] else r["name"] for r in results]
+        idx = col.selectbox(
+            f"{label} 검색 결과", range(len(results)), format_func=lambda i: labels[i],
+            key=f"pick_{label}_{query}",
+        )
+        return results[idx]
+
+    p1, p2 = st.columns(2)
+    origin = pick_place("출발지", q_origin, p1)
+    dest = pick_place("도착지", q_dest, p2)
+    if origin is None or dest is None:
+        st.stop()
+
+    forecast, forecast_note = station_forecast()
+
+    def with_status(cands):
+        """후보 표에 예측 재고 상태를 붙인다(예측이 없으면 '정보 없음')."""
+        cands = cands.copy()
+        if forecast is None:
+            cands["예측상태"] = "정보 없음"
+            cands["예측잔여"] = np.nan
+        else:
+            cands["예측상태"] = cands["station_id"].map(forecast["위험상태"]).fillna("정보 없음")
+            cands["예측잔여"] = cands["station_id"].map(forecast["예측_잔여수량"])
+        return cands
+
+    rent_c = with_status(nearest_to_point(stations, origin["lat"], origin["lon"]))
+    ret_c = with_status(nearest_to_point(stations, dest["lat"], dest["lon"]))
+    for label, place, cands in (("출발지", origin, rent_c), ("도착지", dest, ret_c)):
+        if cands.empty:
+            st.error(
+                f"{label} '{place['name']}'에서 직선 {fmt_distance(MAX_STATION_DIST_M)} 안에 대상 대여소가 없습니다. "
+                "서울 시내의 다른 장소로 검색해 주세요."
+            )
+    if rent_c.empty or ret_c.empty:
+        st.stop()
+
+    def choose(cands, bad_word, role):
+        """가까운 순서로, 예측상 bad_word(부족/포화)가 아닌 첫 대여소를 고른다."""
+        ok = cands[~cands["예측상태"].str.contains(bad_word)]
+        if ok.empty:
+            st.warning(f"{role} 후보 {len(cands)}곳이 모두 '{bad_word} 위험'으로 예측됩니다. 가장 가까운 곳을 표시합니다.")
+            return cands.iloc[0]
+        pick = ok.iloc[0]
+        if pick["station_id"] != cands.iloc[0]["station_id"]:
+            st.caption(
+                f"💡 {role}: 가장 가까운 '{cands.iloc[0]['station_name']}'은(는) '{bad_word} 위험'으로 예측되어 "
+                f"다음으로 가까운 '{pick['station_name']}'을(를) 골랐습니다."
+            )
+        return pick
+
+    rent = choose(rent_c, "부족", "대여")
+    ret = choose(ret_c, "포화", "반납")
+    o = (origin["lat"], origin["lon"])
+    d = (dest["lat"], dest["lon"])
+    s1 = (float(rent["lat"]), float(rent["lon"]))
+    s2 = (float(ret["lat"]), float(ret["lon"]))
+
+    same_station = rent["station_id"] == ret["station_id"]
+    route = None if same_station else bike_leg(s1, s2)
+
+    st.markdown(
+        f"**🚲 대여:** {rent['station_name']} ({rent['gu']}) → **반납:** {ret['station_name']} ({ret['gu']})"
+    )
+    if same_station:
+        st.info("출발지와 도착지에서 가장 가까운 대여소가 같습니다. 자전거를 탈 필요 없이 걸어가는 편이 낫습니다.")
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("자전거 탑승 예상 시간", f"약 {max(1, round(route['duration_s'] / 60))}분",
+                  help="대여소 → 대여소 구간만의 시간입니다. 걷는 시간과 대여·반납 절차 시간은 포함하지 않습니다.")
+        m2.metric("자전거 이동거리", fmt_distance(route["distance_m"]))
+        m3.metric("출발지 → 대여소 (직선)", fmt_distance(rent["straight_m"]))
+        m4.metric("반납 대여소 → 도착지 (직선)", fmt_distance(ret["straight_m"]))
+        if route["estimated"]:
+            st.warning(
+                "자전거 경로 서버에 연결하지 못해 직선거리 × 1.3, 평균 시속 15km로 추정했습니다(점선). "
+                "잠시 후 다시 시도하면 실제 경로로 계산합니다."
+            )
+        if rent["straight_m"] + ret["straight_m"] > route["distance_m"]:
+            st.info("대여소까지 걷는 거리가 자전거 이동거리보다 깁니다. 걸어가는 편이 나을 수 있습니다.")
+    for role, row in (("대여", rent), ("반납", ret)):
+        if row["straight_m"] > WARN_STATION_DIST_M:
+            st.warning(f"{role} 대여소까지 직선으로 {fmt_distance(row['straight_m'])} 떨어져 있습니다. 걸어서 시간이 더 걸릴 수 있습니다.")
+    st.caption(f"ℹ️ {forecast_note}")
+
+    with st.expander("가까운 대여소 후보 보기 (직선거리 순)"):
+        t1, t2 = st.columns(2)
+        for col, title, cands in ((t1, "출발지 근처 (대여)", rent_c), (t2, "도착지 근처 (반납)", ret_c)):
+            col.markdown(f"**{title}**")
+            view = pd.DataFrame({
+                "대여소": cands["station_name"],
+                "구": cands["gu"],
+                "직선거리": cands["straight_m"].map(fmt_distance),
+                "예측 상태": cands["예측상태"],
+                "예측 잔여(대)": cands["예측잔여"],
+            })
+            col.dataframe(one_based(view), width="stretch")
+
+    # 지도: 자전거 경로(빨강), 걷는 구간은 직선 점선(회색, 참고용)
+    path = [list(s1), list(s2)] if route is None else route["path"]
+    pts = [list(o), list(d), list(s1), list(s2), *path]
+    # fit_bounds는 화면 맞춤 애니메이션이 중간에 끊겨 엉뚱한 위치로 열리는 경우가 있어, 중심·확대 단계를 직접 계산한다
+    center, zoom = fit_view(pts)
+    m5 = folium.Map(location=center, zoom_start=zoom)
+    for _, r in stations[~stations["station_id"].isin([rent["station_id"], ret["station_id"]])].iterrows():
+        folium.CircleMarker(location=[r["lat"], r["lon"]], radius=4, color="#8d99ae", fill=True,
+                            fill_opacity=0.8, tooltip=f"{r['station_name']} ({r['gu']})").add_to(m5)
+    for a, b in ((o, s1), (s2, d)):
+        folium.PolyLine([list(a), list(b)], color="#8d99ae", weight=3, dash_array="4 6",
+                        tooltip="걷는 구간 (직선, 참고용)").add_to(m5)
+    if route is not None:
+        style = {"color": "#e63946", "weight": 5, "opacity": 0.9}
+        if route["estimated"]:
+            style["dash_array"] = "8"
+        folium.PolyLine(path, tooltip=f"자전거 약 {fmt_distance(route['distance_m'])}", **style).add_to(m5)
+    for loc, tip, color, icon in (
+        (o, f"출발지: {origin['name']}", "green", "home"),
+        (s1, f"대여: {rent['station_name']}", "red", "star"),
+        (s2, f"반납: {ret['station_name']}", "blue", "flag"),
+        (d, f"도착지: {dest['name']}", "black", "map-marker"),
+    ):
+        folium.Marker(location=list(loc), tooltip=tip,
+                      icon=folium.Icon(color=color, icon=icon, prefix="glyphicon")).add_to(m5)
+    st_folium(m5, width="100%", height=480, returned_objects=[], key="map5_route")
+    st.caption(
+        "주소 검색: Kakao 로컬 API · 경로: © OpenStreetMap contributors (ODbL) · OSRM, routing.openstreetmap.de (FOSSGIS). "
+        "공개 데모 서버를 쓰므로 비상업·소규모 용도로만 사용하세요."
+    )
