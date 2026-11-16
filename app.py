@@ -11,6 +11,11 @@ import requests
 import streamlit as st
 from streamlit_folium import st_folium
 
+# [역할] C안(날짜 예측) 모듈. [원리] 1년 전 기록 + 유사일 + 날씨 가정 + 달력으로 2026년 하루를 예측한다(longterm_c.py 참고).
+import longterm_c as lc
+# [역할] 기상청 단기·중기예보를 C안 날씨 입력으로 바꾸는 모듈(kma_weather.py 참고). 키가 없거나 실패하면 평년값으로 대신한다.
+import kma_weather as kma
+
 
 # ==========================================
 # 0. 경로 및 상수
@@ -28,7 +33,17 @@ TARGET_RETURNS = "returns_target_1h"
 MODEL_OPTIONS = ["GRU", "LightGBM", "XGBoost"]
 PERIOD_OPTIONS = {"오전 출근": "morning", "오후 퇴근": "evening"}  # commute_period 값과 매칭
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
-MAX_DAYS_AHEAD = 365  # 날짜 선택 가능 범위: 오늘 ~ 1년 뒤
+MAX_DAYS_AHEAD = 365  # 날짜 선택 가능 범위: 오늘 ~ 1년 뒤 (기존 '같은 요일 재생' 방식에서만 사용)
+
+# [역할] 예측 방식 선택지와 C안 파일 위치.
+# [원리] 기본은 C안(실제 날짜 예측). 기존 1시간 모델의 '같은 요일 재생'은 비교용으로 남긴다.
+#        C안은 팀 목표(7일 이내 날짜 선택)에 맞춰 오늘부터 7일까지만 고를 수 있고, 데이터 끝(2025-12-31)에서 364일 뒤까지만 가능하다.
+METHOD_LT = "날짜 예측 (작년 기록 + 날씨 · 추천)"
+METHOD_REPLAY = "과거 같은 요일 재생 (1시간 모델 · 비교용)"
+LT_MODEL_DIR = MODEL_DIR / "longterm_c"
+LT_DATA_DIR = DATA_DIR / "longterm_c"
+LT_DAYS_AHEAD = 7
+LT_MODEL_LABEL = "C안 LightGBM"
 
 # 자전거 경로: FOSSGIS가 운영하는 공개 OSRM 서버(자전거 프로필). 비상업·소규모 사용용이며 초당 1회 이하로 호출해야 한다.
 ROUTING_BASE = "https://routing.openstreetmap.de/routed-bike"
@@ -306,7 +321,16 @@ def run_prediction(model_name, date, period_label):
     sub = sub.sort_values(["station_id", "timestamp"])
     sub["pred_rentals"] = predict_rows(model_name, TARGET_RENTALS, sub)
     sub["pred_returns"] = predict_rows(model_name, TARGET_RETURNS, sub)
+    return summarize_period(sub, model_name)
 
+
+# [역할] 시간별 예측(sub)을 대여소별 표(지도·표·길찾기에서 쓰는 형태)로 요약한다.
+# [원리] 피크 시간대 3시간의 예측 대여·반납을 더하고, 시간대 시작 재고 + (반납 - 대여)로 끝날 때 재고를 추정해
+#        3대 이하면 부족, 거치대-3 이상이면 포화로 표시한다. 기존 1시간 모델과 C안(날짜 예측)이 함께 쓰도록 run_prediction에서 분리했다.
+#        sub에 필요한 열: station_id, timestamp, hour, latitude, longitude, dock_count, inventory_lag_1h, pred_rentals, pred_returns
+#        (실제값 열·기상 열은 있으면 쓰고 없으면 건너뛴다)
+def summarize_period(sub, model_name):
+    sub = sub.sort_values(["station_id", "timestamp"])
     # 대여소별로 피크 시간대 전체(시간별 예측의 합)를 집계
     spec = {
         "위도": ("latitude", "first"),
@@ -355,10 +379,11 @@ def run_prediction(model_name, date, period_label):
     out["구분"] = out["group"].fillna("미상")
     out = out.drop(columns=["station_name", "gu", "group"])
 
-    # 관측 기상 (모델 입력으로 쓰인 1시간 전 관측값; 서울 단일 관측소라 모든 대여소가 같음)
+    # 관측 기상 (모델 입력으로 쓰인 1시간 전 관측값; 서울 단일 관측소라 모든 대여소가 같음). C안처럼 열이 없으면 결측.
+    has_wx = {"temp_c_lag1h", "precip_mm_lag1h"}.issubset(sub.columns)
     wx = sub.groupby("timestamp").agg(
         temp=("temp_c_lag1h", "mean"), precip=("precip_mm_lag1h", "mean")
-    )
+    ) if has_wx else pd.DataFrame({"temp": [np.nan], "precip": [np.nan]})
     info = {
         "hour_min": int(sub["hour"].min()),
         "hour_max": int(sub["hour"].max()),
@@ -386,6 +411,109 @@ def run_daily_prediction(model_name, date):
     sub["대여소ID"] = sub["station_id"]
     sub["대여소명"] = sub["station_name"].fillna(sub["station_id"])
     return sub[["대여소ID", "대여소명", "hour", "pred_rentals", "pred_returns"]]
+
+
+# ==========================================
+# 3-1. C안(날짜 예측) 연결
+# ==========================================
+# [역할] C안에 필요한 파일이 모두 있는지 확인. [원리] 없으면 화면에 어떤 파일이 빠졌는지 보여 주고 그 화면만 멈춘다.
+LT_FILES = [LT_MODEL_DIR / n for n in ("model_rentals.txt", "model_returns.txt", "preprocess.json", "meta.json")] + \
+           [LT_DATA_DIR / n for n in ("history_hourly.parquet", "daily_weather.csv", "station_static.csv", "holidays.csv")]
+
+
+def lt_files_missing():
+    return [p for p in LT_FILES if not p.exists()]
+
+
+# [역할] C안 모델·자료를 한 번만 읽어 둔다. [원리] st.cache_resource는 앱이 켜져 있는 동안 같은 객체를 재사용한다.
+@st.cache_resource(show_spinner="날짜 예측 모델을 불러오는 중입니다...")
+def load_lt_bundle():
+    return lc.load_bundle(LT_MODEL_DIR, LT_DATA_DIR)
+
+
+# [역할] 고른 날짜·날씨 가정으로 60곳 × 24시간 예측. [원리] 같은 날짜·같은 날씨면 다시 계산하지 않도록 결과를 캐시한다.
+#        weather_items는 (이름, 값) 튜플들 — 캐시 키로 쓰려면 바뀌지 않는(해시 가능한) 형태여야 한다.
+@st.cache_data(show_spinner="날짜 예측 모델로 하루치를 계산하는 중입니다...")
+def run_lt_day(date, weather_items):
+    day = lc.predict_day(date, dict(weather_items), load_lt_bundle())
+    return day, list(day.attrs.get("similar_dates", []))
+
+
+# [역할] C안 결과를 기존 지도·표·길찾기와 같은 형태(대여소별 표 + info)로 만든다.
+# [원리] 피크 시간대 3시간만 골라 summarize_period로 요약. 시작 재고는 실제 재고가 없으므로
+#        '작년 같은 시기 같은 시각 평균 재고'(inventory_ly)로 대신한다 → 화면에 추정값이라고 표시한다.
+def run_prediction_lt(date, period_label, weather_items):
+    day, sims = run_lt_day(date, weather_items)
+    static = load_lt_bundle().static[["station_id", "latitude", "longitude", "dock_count"]]
+    sub = day[day["commute_period"] == PERIOD_OPTIONS[period_label]].merge(static, on="station_id", how="left")
+    sub = sub.rename(columns={"inventory_ly": "inventory_lag_1h"})
+    out, info = summarize_period(sub, LT_MODEL_LABEL)
+    info["similar_dates"] = sims
+    return out, info
+
+
+# [역할] 3번 메뉴(시간대별 그래프)용 하루치 표. [원리] 기존 run_daily_prediction과 같은 열 이름으로 돌려준다.
+def run_daily_lt(date, weather_items):
+    day, sims = run_lt_day(date, weather_items)
+    day = day.merge(load_stations(), on="station_id", how="left")
+    day["대여소ID"] = day["station_id"]
+    day["대여소명"] = day["station_name"].fillna(day["station_id"])
+    return day[["대여소ID", "대여소명", "hour", "pred_rentals", "pred_returns"]], sims
+
+
+# [역할] C안 파일이 없으면 안내 후 멈춘다(예측이 필요한 화면 전용).
+def require_lt():
+    missing = lt_files_missing()
+    if missing:
+        st.error("날짜 예측(C안)에 필요한 파일이 없습니다. 아래 파일을 넣거나 사이드바에서 '과거 같은 요일 재생'을 고르세요.")
+        st.code("\n".join(str(p.relative_to(APP_DIR)) for p in missing))
+        st.stop()
+
+
+# [역할] 기상청 예보 받기(30분마다 새로). [원리] time_bucket이 30분 단위로 바뀌면 캐시가 새로 계산된다.
+#        성공한 결과만 캐시한다: 실패하면 예외를 던지고(Streamlit은 예외를 캐시하지 않음) 바깥에서 받아 평년값으로 대신한다.
+#        그래서 일시적인 실패나 키 등록 직후에도 30분을 기다리지 않고 다음 화면 갱신 때 다시 시도한다.
+@st.cache_data(show_spinner="기상청 예보를 받는 중입니다...", ttl=1800)
+def _kma_forecast_cached(time_bucket):
+    table, notes = kma.fetch_forecast(kma.service_key())   # 키는 함수 안에서 읽어 캐시 키에 남기지 않는다
+    if not table:
+        raise RuntimeError("; ".join(notes) or "예보 없음")
+    return table, notes
+
+
+def load_kma_forecast(time_bucket):
+    """결과: (날짜별 예보 표, 실패 메모). 키가 없거나 실패하면 빈 표와 이유를 돌려준다."""
+    if not kma.service_key():
+        return {}, ["기상청 서비스 키(KMA_SERVICE_KEY)가 없습니다."]
+    try:
+        return _kma_forecast_cached(time_bucket)
+    except Exception as e:  # noqa: BLE001 — 이유를 화면 설명에 보여 준다
+        return {}, [str(e)]
+
+
+# [역할] C안 결과 위에 '어떻게 예측했는지' 안내. [원리] 사용한 유사일·날씨 가정·보정·재고 추정 방식을 그대로 밝힌다.
+def show_lt_banner(sims):
+    wx = dict(weather_items)
+    sim_text = ", ".join(str(s) for s in sims) if sims else "없음(후보 부족)"
+    factor = lc.h2_factor(selected_date, load_lt_bundle(), "rentals")
+    st.info(
+        f"📅 **날짜 예측(C안)** {selected_date}({WEEKDAYS[selected_date.weekday()]}) — 2025년 같은 시기 기록, "
+        f"작년 비슷한 날씨의 날({sim_text}), 날씨[{wx.get('source', '가정')}](최저 {wx['temp_min']}℃ / 최고 {wx['temp_max']}℃, "
+        f"오전 {lc.PRECIP_LABELS[wx['precip_am_cat']]}, 오후 {lc.PRECIP_LABELS[wx['precip_pm_cat']]}"
+        f"{', 강수 형태 눈' if wx.get('snow') else ''})으로 예측했습니다."
+        + (f" 2026년 하반기라 상반기 통계 감소분을 절반 반영해 예측에 ×{factor:.3f}를 곱했습니다." if factor != 1 else "")
+        + " **'현재자전거수'는 작년 같은 시각 평균 재고로 추정한 값**이라 실제 재고와 다를 수 있습니다."
+        " 참고: 같은 방식의 2025년 테스트에서 시간당 평균 오차는 약 1.4대였고, 다소 많게 예측하는 경향이 있었습니다."
+    )
+    # [추가 2026-11-16 눈] 눈 예보일(전날 눈 포함) 불확실성 안내.
+    # [원리] 학습 기간 5년(1,826일) 중 눈 추정일은 83일뿐이고, 모델은 적설량(1cm인지 10cm인지)을 모른다.
+    #        그래서 눈 오는 날 예측은 평소보다 크게 빗나갈 수 있음을 숫자와 함께 알린다.
+    if lc.is_snow_day(wx):
+        st.warning(
+            "❄️ **눈 예보일(또는 전날 눈)입니다.** 모델이 배운 눈 오는 날은 5년 중 83일뿐이고, 적설량(1cm인지 10cm인지)을 "
+            "구분하지 못합니다. 빙판·폭설이면 실제 이용은 이 예측보다 훨씬 적을 수 있으니 참고용으로만 보세요."
+            + (" 최저기온이 영상인 눈은 학습 자료에 없던 조합이라 더 불확실합니다." if wx.get("snow") and wx["temp_min"] > 0 else "")
+        )
 
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -515,6 +643,17 @@ def kakao_search(query):
 def station_forecast():
     """사이드바 조건(모델·날짜·피크 시간대)의 대여소별 예측 상태. (표 또는 None, 안내 문구).
     예측이 안 돼도 길찾기는 계속되도록 st.stop() 없이 None을 돌려준다."""
+    # [역할] 4번 메뉴(길찾기)의 재고 상태. [원리] C안이면 날짜 예측 결과를 쓰고, 시작 재고가 추정값임을 안내에 적는다.
+    if use_lt:
+        if lt_files_missing():
+            return None, "날짜 예측 파일이 없어 재고 예측 상태는 표시하지 않습니다."
+        try:
+            df_pred, _ = run_prediction_lt(selected_date, period_label, weather_items)
+        except Exception:
+            return None, "예측 중 오류가 나서 재고 예측 상태는 표시하지 않습니다."
+        note = (f"재고 상태는 {selected_date} {period_label} 날짜 예측(C안, 날씨 가정 포함) 기준이며, 시작 재고는 "
+                "작년 같은 시각 평균으로 추정한 참고값입니다. 실제 실시간 재고가 아닙니다.")
+        return df_pred.set_index("대여소ID")[["위험상태", "예측_잔여수량", "총거치대수"]], note
     if missing_files(model_type):
         return None, "예측 모델·데이터 파일이 없어 재고 예측 상태는 표시하지 않습니다."
     try:
@@ -556,21 +695,90 @@ mode = st.sidebar.radio(
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("⚙️ 예측 AI 모델 및 조건 설정")
-model_type = st.sidebar.selectbox("예측 모델 선택", MODEL_OPTIONS)
+# [역할] 예측 방식 선택. [원리] C안은 고른 날짜를 실제로 예측하고, 기존 방식은 같은 요일 과거 하루를 1시간 모델로 재생한다.
+method = st.sidebar.radio(
+    "예측 방식", [METHOD_LT, METHOD_REPLAY],
+    help="날짜 예측: 2025년 같은 시기 기록·작년 비슷한 날씨의 날·날씨 가정·공휴일로 고른 날짜를 예측합니다(테스트 2025 검증).\n"
+         "같은 요일 재생: 고른 날짜와 같은 요일의 과거 하루 실제 기록을 1시간 모델에 넣는 비교용 시뮬레이션입니다.",
+)
+use_lt = method == METHOD_LT
+lt_missing = lt_files_missing() if use_lt else []
+model_type = st.sidebar.selectbox("예측 모델 선택", MODEL_OPTIONS, index=MODEL_OPTIONS.index("LightGBM"),
+                                  disabled=use_lt, help="날짜 예측에서는 C안 LightGBM으로 고정됩니다.")
+if use_lt:
+    model_type = LT_MODEL_LABEL   # 화면 제목·지도 key에 표시되는 이름 (기존 모델 경로에서는 쓰이지 않음)
 
 today = pd.Timestamp.now(tz="Asia/Seoul").date()
-selected_date = st.sidebar.date_input(
-    "날짜 선택 (오늘 이후)",
-    value=today,
-    min_value=today,
-    max_value=today + dt.timedelta(days=MAX_DAYS_AHEAD),
-)
+# [역할] 날짜 범위. [원리] C안은 오늘~7일(팀 목표) 그리고 모델이 계산 가능한 마지막 날(2026-12-30) 중 이른 날까지.
+if use_lt:
+    lt_last = dt.date(2026, 12, 30) if lt_missing else dt.date.fromisoformat(load_lt_bundle().meta["max_target_date"])
+    lt_max = min(today + dt.timedelta(days=LT_DAYS_AHEAD), lt_last)
+    if lt_max < today:
+        st.sidebar.error(f"날짜 예측은 {lt_last}까지만 가능합니다(2025년 기록 기준). 새 기록으로 묶음을 갱신해야 합니다.")
+        lt_max = today
+    selected_date = st.sidebar.date_input(f"날짜 선택 (오늘부터 {LT_DAYS_AHEAD}일 이내)", value=today,
+                                          min_value=today, max_value=lt_max)
+else:
+    selected_date = st.sidebar.date_input(
+        "날짜 선택 (오늘 이후)",
+        value=today,
+        min_value=today,
+        max_value=today + dt.timedelta(days=MAX_DAYS_AHEAD),
+    )
 period_label = st.sidebar.selectbox("피크 시간대 선택", list(PERIOD_OPTIONS))
 selected_station_id = sidebar_station_picker(disabled=mode.startswith("4."))
-st.sidebar.caption(
-    "선택한 날짜는 아직 실제 데이터가 없으므로, 같은 요일의 가장 최근 실제 데이터(대여·반납 이력, 재고, 기상)를 "
-    "모델에 입력해 예측하는 시뮬레이션입니다."
-)
+
+# [역할] 날씨 입력(C안 전용). [원리] ① 기상청 예보가 있으면 그 값을 기본값으로 채운다(단기예보 우선, 없으면 중기예보).
+#        ② 키가 없거나 그날 예보가 없으면 2021~2025년 같은 시기(±7일) 평균 기온 + '비 없음'(평년값)을 쓴다.
+#        ③ 사용자가 값을 고치면 그 값으로 예측하고 출처를 '수정됨'으로 표시한다.
+#        위젯 key에 날짜·출처를 넣어, 날짜나 예보가 바뀌면 기본값이 새로 채워지게 한다.
+weather_items = None
+if use_lt and not lt_missing:
+    now_kst = pd.Timestamp.now(tz="Asia/Seoul").tz_localize(None).to_pydatetime()
+    fc_table, fc_notes = load_kma_forecast(now_kst.strftime("%Y%m%d%H") + ("30" if now_kst.minute >= 30 else "00"))
+    fc = kma.to_model_weather(selected_date, fc_table)
+    if fc:
+        d_tmin, d_tmax, d_am, d_pm, d_snow, src = (fc["temp_min"], fc["temp_max"], fc["precip_am_cat"],
+                                                    fc["precip_pm_cat"], fc["snow_prev"], f"기상청 {fc['source']}")
+        d_is_snow = int(fc.get("snow", 0))
+    else:
+        (d_tmin, d_tmax), d_am, d_pm, d_snow, src = lc.climatology(load_lt_bundle().daily, selected_date), 0, 0, 0.0, "평년값"
+        d_is_snow = 0
+    tag = f"{selected_date}_{src}"
+    title = "🌦️ 날씨 (기상청 예보)" if fc else "🌦️ 날씨 가정 (평년값)"
+    with st.sidebar.expander(title, expanded=False):
+        # [수정 2026-11-16] 기온은 소수점 첫째 자리까지만 입력·표시(기상청 예보·학습 자료도 0.1℃ 단위). +/- 버튼은 0.1℃씩.
+        t_min = st.number_input("최저기온 (℃)", value=round(float(d_tmin), 1), step=0.1, format="%.1f", key=f"lt_tmin_{tag}")
+        t_max = st.number_input("최고기온 (℃)", value=round(float(d_tmax), 1), step=0.1, format="%.1f", key=f"lt_tmax_{tag}")
+        am = st.selectbox("오전 강수", range(4), index=int(d_am), format_func=lambda i: lc.PRECIP_LABELS[i], key=f"lt_am_{tag}")
+        pm = st.selectbox("오후 강수", range(4), index=int(d_pm), format_func=lambda i: lc.PRECIP_LABELS[i], key=f"lt_pm_{tag}")
+        # [추가 2026-11-16 눈] 강수 형태. [원리] '눈'을 고르면 기온과 관계없이 눈으로 예측한다(강수량이 '없음'이면 약한 눈으로 처리).
+        #        '비'면 학습 때 규칙대로 최저기온 0℃ 이하일 때만 눈으로 추정한다. 기상청이 눈을 예보하면 '눈'이 기본값.
+        snow = st.selectbox("강수 형태", [0, 1], index=d_is_snow, key=f"lt_snow_{tag}",
+                            format_func=lambda i: "눈" if i else "비 (최저기온 0℃ 이하면 눈으로 자동 판단)")
+        if fc:
+            st.caption(f"출처: {src}. 값을 고치면 고친 값으로 예측합니다. 모델은 실제 날씨로 학습되어, 예보가 틀리면 예측도 틀릴 수 있습니다.")
+        else:
+            st.caption("기상청 예보를 쓰지 못해 2021~2025년 같은 시기 평균 기온(평년값)과 '비 없음'을 기본값으로 넣었습니다."
+                       + (f" ({'; '.join(fc_notes)[:160]})" if fc_notes else ""))
+    # 기온은 0.1℃ 단위로 반올림해서 비교·사용한다(+/- 버튼을 누르면 8.200000001 같은 오차가 생길 수 있어서).
+    t_min, t_max = round(float(t_min), 1), round(float(t_max), 1)
+    edited = (t_min, t_max, int(am), int(pm), int(snow)) != \
+        (round(float(d_tmin), 1), round(float(d_tmax), 1), int(d_am), int(d_pm), int(d_is_snow))
+    weather_items = (("temp_min", float(t_min)), ("temp_max", float(t_max)),
+                     ("precip_am_cat", int(am)), ("precip_pm_cat", int(pm)), ("snow_prev", float(d_snow)),
+                     ("snow", int(snow)), ("source", src + (" · 사용자 수정" if edited else "")))
+    st.sidebar.caption(
+        "날짜 예측(C안): 최근 기록 없이 2025년 같은 시기 기록과 날씨로 예측합니다. "
+        "2025년 테스트에서 '작년 같은 시기 평균'보다 오차가 약 21% 작았습니다."
+    )
+elif use_lt:
+    st.sidebar.error("날짜 예측 파일이 없습니다. models/longterm_c, data/longterm_c 폴더를 확인하세요.")
+else:
+    st.sidebar.caption(
+        "선택한 날짜는 아직 실제 데이터가 없으므로, 같은 요일의 가장 최근 실제 데이터(대여·반납 이력, 재고, 기상)를 "
+        "모델에 입력해 예측하는 시뮬레이션입니다."
+    )
 
 
 def get_reference_date():
@@ -598,6 +806,14 @@ def get_reference_date():
 
 
 def get_predictions():
+    # [역할] 1·2번 메뉴 공통 예측. [원리] C안이면 날짜 예측, 아니면 기존 '같은 요일 재생'을 쓴다. 돌려주는 형태는 같다.
+    if use_lt:
+        require_lt()
+        df_pred, info = run_prediction_lt(selected_date, period_label, weather_items)
+        show_lt_banner(info["similar_dates"])
+        if info["excluded"]:
+            st.caption(f"⚠️ 작년 같은 시각 재고 기록이 없는 대여소 {info['excluded']}곳은 지도·표에서 제외했습니다.")
+        return df_pred, info
     ref_date = get_reference_date()
     df_pred, info = run_prediction(model_type, ref_date, period_label)
     if df_pred is None:
@@ -797,11 +1013,17 @@ elif mode == "2. K-Means 클러스터 분석":
 # Mode 3: 시간대별 대여·반납 예측 (선 그래프)
 # ------------------------------------------
 elif mode == "3. 시간대별 대여·반납 예측 (선 그래프)":
-    ref_date = get_reference_date()
-    daily = run_daily_prediction(model_type, ref_date)
-    if daily is None:
-        st.warning(f"참조일({ref_date})의 데이터가 없습니다. 다른 날짜를 선택해 주세요.")
-        st.stop()
+    # [역할] 하루치 시간별 예측 가져오기. [원리] C안이면 날짜 예측 결과(24시간), 아니면 기존 참조일 재생.
+    if use_lt:
+        require_lt()
+        daily, sims = run_daily_lt(selected_date, weather_items)
+        show_lt_banner(sims)
+    else:
+        ref_date = get_reference_date()
+        daily = run_daily_prediction(model_type, ref_date)
+        if daily is None:
+            st.warning(f"참조일({ref_date})의 데이터가 없습니다. 다른 날짜를 선택해 주세요.")
+            st.stop()
 
     weekday = WEEKDAYS[selected_date.weekday()]
     st.subheader(f"📈 [{model_type} 모델] {selected_date}({weekday}) 시간대별 예측 대여·반납 대수")
