@@ -49,6 +49,23 @@
   
 ---
 
+## 기술 스택
+
+| 구분 | 사용 기술 |
+|---|---|
+| 언어 | Python 3.12 |
+| 데이터 처리 | pandas, NumPy, PyArrow (Parquet) |
+| 머신러닝 | LightGBM, XGBoost, scikit-learn |
+| 딥러닝 | TensorFlow / Keras (GRU) |
+| 하이퍼파라미터 튜닝 | Optuna (TPE Sampler) |
+| 모델 저장 | joblib (`.pkl`), Keras (`.keras`) |
+| 대시보드 | Streamlit |
+| 지도 시각화 | Folium, streamlit-folium |
+| 경로 탐색 | OSRM 공개 서버 (routing.openstreetmap.de, 자전거 프로필), requests |
+| 개발 환경 | Jupyter Notebook, Git / GitHub |
+
+---
+
 ## 데이터 처리 과정
 
 - 공공 자전거 데이터 수집   
@@ -66,3 +83,65 @@
 
 ---
 
+## 모델별 구성
+
+| 모델 | 노트북 | 주요 설정 | 역할 |
+|---|---|---|---|
+| **Seasonal Naive** | `train_seasonalnaive.ipynb` | 1주(168시간) 전 같은 시각의 값을 그대로 예측 | 비교 기준(베이스라인) |
+| **LightGBM** | `train_lightgbm.ipynb` | `learning_rate=0.05`, `num_leaves=31`, `n_estimators=1500`, Early Stopping(30) |  |
+| **LightGBM + Optuna** | `train_lightgbm2.ipynb` | TPE 탐색(학습 데이터 10% 샘플, 검증 MAE 최소화) 후 전체 재학습 | 대시보드 모델 |
+| **XGBoost** | `train_xgboost.ipynb` | `learning_rate=0.05`, `max_depth=6`, `reg:squarederror` | 대시보드 모델 |
+| **GRU** | `train_gru.ipynb` | 범주형 Embedding(8차원) + 수치형 결합 → GRU(64) → Dense(32) → 출력, Adam(0.005), MAE 손실, Early Stopping(2) | 대시보드 모델 |
+
+---
+
+## 대시보드별 기능 소개
+
+사이드바 **통합 운영 제어판**에서 메뉴, 예측 모델(GRU / LightGBM / XGBoost), 날짜(오늘~1년 뒤), 피크 시간대(오전 출근 / 오후 퇴근), 대여소를 고릅니다.
+
+> **시뮬레이션 방식:** 미래 날짜는 실제 데이터가 없으므로, 선택한 날짜와 **같은 요일의 가장 최근 실제 데이터**(평일은 휴일이 아닌 날 우선)를 참조일로 골라 모델에 입력합니다. 화면 상단에 참조일이 안내됩니다. 실제 기상 예보와 선택일의 공휴일 여부는 반영하지 않습니다.
+
+### ① 실시간 수급 불균형 지도
+- 선택한 피크 시간대의 대여소별 예측 대여·반납 합계로 **Net-flow(반납 − 대여)** 를 계산합니다.
+- `시작 시점 재고 + Net-flow`로 예측 잔여 자전거 수를 구하고 위험 상태를 분류합니다.
+  - 🔴 **부족 위험** — 예측 잔여 3대 이하 (대여 불가)
+  - 🔵 **포화 위험** — 거치대 여유 3칸 이하 (반납 불가)
+  - 🟢 **정상**
+- 분석 대여소 수와 부족·포화 위험 대여소 수를 요약해 보여줍니다.
+- 지도 마커 팝업에서 대여소별 예측 대여·반납, Net-flow, 예측 잔여 수를 확인할 수 있습니다.
+- 상세표에서 예측 Net-flow와 **참조일의 실제 Net-flow**를 나란히 비교할 수 있습니다.
+
+### ② 클러스터 분석
+- 대여소를 자치구 단위로 묶어 대여소 수, 평균 Net-flow, 평균 예측 잔여 수를 표로 집계합니다.
+- 업무 밀집 지역에서 수급 불균형이 함께 나타나는지 지도로 확인합니다.
+- ※ 메뉴 이름은 'K-Means'이지만, 현재 코드는 K-Means가 아니라 자치구(`gu`) 기준으로 묶습니다.
+
+### ③ 시간대별 대여·반납 예측 (선 그래프)
+- 참조일 하루(0~23시) 전체의 시간당 예측 대여(빨강)·반납(파랑)을 선 그래프로 그립니다.
+- 대여소를 선택하면 해당 대여소만, 선택하지 않으면 전체 대여소 합계를 보여줍니다.
+- 시간별 예측값 표를 펼쳐 볼 수 있습니다.
+
+---
+
+## 로컬 기동 및 실행 방법
+### 요구 사항
+- Python 3.12
+- ④번 메뉴(경로 지도)를 쓰려면 인터넷 연결이 필요합니다.
+
+### 설치 및 실행 (Windows PowerShell)
+
+```
+# 1. 저장소 받기
+git clone <저장소 URL>
+cd ringring
+
+# 2. 가상환경 생성 및 활성화
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+
+# 3. 패키지 설치
+pip install -r requirements.txt
+
+# 4. 대시보드 실행
+streamlit run app.py
+```
