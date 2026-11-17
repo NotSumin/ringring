@@ -31,5 +31,26 @@
     "https://mobile.newsis.com/view/NISX20260428_0003608893 (노동절·제헌절 공휴일)"
   ],
   "h1_source": "서울특별시 공공자전거 대여소별 이용정보(월별) 2025·2026 1~6월 (서울 열린데이터광장 OA-15249)",
-  "weather_note": "학습은 실측 날씨. 앱은 기상청 예보 연결 전까지 사용자가 입력한 날씨 가정(기본값은 평년값)을 쓴다."
+  "weather_note": "학습은 실측 날씨. 앱은 기상청 예보 연결 전까지 사용자가 입력한 날씨 가정(기본값은 평년값)을 쓴다.",
+  "test_2025_by_model": {
+    "LightGBM": {
+      "rentals_MAE": 1.444,
+      "returns_MAE": 1.431,
+      "rentals_Bias": 0.191,
+      "returns_Bias": 0.178
+    },
+    "XGBoost": {
+      "rentals_MAE": 1.451,
+      "rentals_Bias": 0.217,
+      "returns_MAE": 1.441,
+      "returns_Bias": 0.21
+    },
+    "GRU": {
+      "rentals_MAE": 1.468,
+      "rentals_Bias": 0.292,
+      "returns_MAE": 1.434,
+      "returns_Bias": 0.194
+    }
+  },
+  "models_note": "XGBoost·GRU 추가(2026-11-16): 같은 입력·city 보정, 2022~2025 배포 학습(검증 멈춘 지점 고정). 점수는 2022~2023 학습 모델의 테스트 2025."
 }

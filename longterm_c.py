@@ -195,14 +195,90 @@ def h2_factor(day, b, target):
     return 1.0
 
 
-def predict_day(day, weather, b):
-    """[역할] 하루치 예측. [원리] 입력 표 → 두 모델 예측(음수는 0) → 하반기 보정.
-    돌려주는 표: station_id, timestamp, hour, commute_period, pred_rentals, pred_returns, inventory_ly(작년 같은 시각 평균 재고)."""
-    f = build_features(day, weather, b)
-    X = to_model_input(f, b)
+# ==========================================
+# 추가 모델(XGBoost·GRU) — 2026-11-16
+# ==========================================
+# [역할] 날짜 예측에서 LightGBM 말고 XGBoost·GRU도 고를 수 있게 한다.
+# [원리] 세 모델 모두 같은 입력 표(build_features)를 쓰고, 모델마다 학습 때와 똑같은 전처리만 다르게 적용한다.
+#        학습 코드: 머신러닝 팀프로젝트/experiments/longterm_c/train_extra_models.py (전처리 함수는 그 파일과 같아야 한다).
+EXTRA_FILES = {'XGBoost': ('xgb_{t}.json', 'xgb_{t}_preprocess.json'),
+               'GRU': ('gru_{t}.keras', 'gru_{t}_preprocess.json')}
+
+
+def available_models(model_dir):
+    """[역할] 화면의 모델 선택지. [원리] LightGBM은 기본, 나머지는 대여·반납 파일이 모두 있을 때만 보인다."""
+    model_dir = Path(model_dir)
+    names = ['LightGBM']
+    for name, (m, p) in EXTRA_FILES.items():
+        if all((model_dir / x.format(t=t)).exists() for t in ('rentals', 'returns') for x in (m, p)):
+            names.append(name)
+    return names
+
+
+def load_extra(model_dir, name):
+    """[역할] XGBoost·GRU 모델과 전처리 정보 읽기. [원리] 무거운 라이브러리(tensorflow)는 그 모델을 고를 때만 불러온다.
+    XGBoost는 한글 경로 문제를 피하려고 파일 내용을 메모리로 읽어 불러온다."""
+    model_dir = Path(model_dir)
+    out = {}
+    for t in ('rentals', 'returns'):
+        m_name, p_name = (x.format(t=t) for x in EXTRA_FILES[name])
+        pre = json.loads((model_dir / p_name).read_text(encoding='utf-8'))
+        if name == 'XGBoost':
+            import xgboost as xgb
+            model = xgb.Booster()
+            model.load_model(bytearray((model_dir / m_name).read_bytes()))
+        else:
+            import tensorflow as tf
+            model = tf.keras.models.load_model(model_dir / m_name, compile=False)
+        out[t] = (model, pre)
+    return out
+
+
+def xgb_input(f, pre):
+    """[역할] XGBoost 입력 표. [원리] 학습과 같게: 범주형은 학습 범주 목록으로 고정(처음 보는 값은 결측), 나머지는 실수."""
+    X = pd.DataFrame(index=f.index)
+    for c in pre['inputs']:
+        X[c] = pd.Categorical(f[c].astype(str).where(f[c].notna()), categories=pre['categories'][c]) \
+            if c in pre['categories'] else f[c].astype('float64')
+    return X
+
+
+def gru_input(f, pre):
+    """[역할] GRU 입력 배열(대여소별 하루 24시간 순서). [원리] 학습과 같게: 숫자는 학습 평균·표준편차로 맞추고 결측은 0,
+    결측 여부 표시 열을 붙이며, 범주는 학습 때 번호(처음 보는 값 0). f는 대여소·시각 순으로 하루 24행씩이어야 한다."""
+    assert len(f) % 24 == 0 and (f.timestamp.dt.hour.to_numpy().reshape(-1, 24) == np.arange(24)).all()
+    X = f[pre['nums']].astype('float64')
+    Z = (X - pd.Series(pre['mean'])) / pd.Series(pre['std'])
+    num = np.concatenate([Z.fillna(0).to_numpy(), X[pre['miss_cols']].isna().to_numpy(dtype='float64')], axis=1)
+    cat = np.stack([f[c].astype(str).where(f[c].notna()).map(pre['cat_maps'][c]).fillna(0).to_numpy(dtype='int32')
+                    for c in pre['cats']], axis=1)
+    n = len(f) // 24
+    return num.reshape(n, 24, -1).astype('float32'), cat.reshape(n, 24, -1)
+
+
+def model_predict(f, b, model_name, extra, target):
+    """[역할] 고른 모델로 입력 표 f의 예측값(음수는 0). [원리] 모델 종류에 맞는 전처리 후 예측."""
+    if model_name == 'LightGBM':
+        return np.clip(b.models[target].predict(to_model_input(f, b)), 0, None)
+    model, pre = extra[target]
+    if model_name == 'XGBoost':
+        import xgboost as xgb
+        d = xgb.DMatrix(xgb_input(f, pre), enable_categorical=True)
+        return np.clip(model.predict(d, iteration_range=(0, int(pre['best_iteration']))), 0, None)
+    num, cat = gru_input(f, pre)
+    return np.clip(model.predict((num, cat), batch_size=1024, verbose=0).reshape(-1), 0, None)
+
+
+def predict_day(day, weather, b, model_name='LightGBM', extra=None):
+    """[역할] 하루치 예측. [원리] 입력 표 → 고른 모델 예측(음수는 0) → 하반기 보정.
+    돌려주는 표: station_id, timestamp, hour, commute_period, pred_rentals, pred_returns, inventory_ly(작년 같은 시각 평균 재고).
+    [추가 2026-11-16] model_name: 'LightGBM'(기본)·'XGBoost'·'GRU'. 추가 모델은 load_extra 결과를 extra로 넘긴다."""
+    f0 = build_features(day, weather, b)
+    sims = f0.attrs['similar_dates']          # 정렬 전에 꺼내 둔다(정렬하면 attrs가 사라질 수 있음)
+    f = f0.sort_values(['station_id', 'timestamp']).reset_index(drop=True)   # GRU는 대여소별 24시간 순서가 필요
     out = f[['station_id', 'timestamp', 'hour', 'commute_period']].copy()
     for t in ('rentals', 'returns'):
-        out[f'pred_{t}'] = np.clip(b.models[t].predict(X), 0, None) * h2_factor(day, b, t)
+        out[f'pred_{t}'] = model_predict(f, b, model_name, extra, t) * h2_factor(day, b, t)
     out['inventory_ly'] = f['inventory_ly_4w_mean']
-    out.attrs['similar_dates'] = f.attrs['similar_dates']
+    out.attrs['similar_dates'] = sims
     return out
