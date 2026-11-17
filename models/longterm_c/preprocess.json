@@ -1,0 +1,82 @@
+{
+  "inputs": [
+    "hour",
+    "day_of_week",
+    "month",
+    "is_weekend",
+    "commute_period",
+    "is_holiday",
+    "holiday_type",
+    "is_offday",
+    "is_day_before_offday",
+    "is_day_after_offday",
+    "offday_block_len",
+    "is_labor_day",
+    "latitude",
+    "longitude",
+    "region",
+    "dock_count",
+    "station_group",
+    "subway_dist_m",
+    "is_station_area",
+    "rentals_lag_52w",
+    "rentals_ly_4w_mean",
+    "returns_lag_52w",
+    "returns_ly_4w_mean",
+    "inventory_ly_4w_mean",
+    "rentals_simday_mean",
+    "returns_simday_mean",
+    "simday_n",
+    "temp_min_day",
+    "temp_max_day",
+    "rain_am",
+    "rain_pm",
+    "precip_am_cat",
+    "precip_pm_cat",
+    "snow_est_day",
+    "snow_est_prev_day"
+  ],
+  "categories": {
+    "commute_period": [
+      "evening",
+      "morning",
+      "other"
+    ],
+    "region": [
+      "강남구",
+      "강동구",
+      "강서구",
+      "관악구",
+      "광진구",
+      "구로구",
+      "금천구",
+      "노원구",
+      "도봉구",
+      "동대문구",
+      "마포구",
+      "서대문구",
+      "서초구",
+      "성동구",
+      "성북구",
+      "송파구",
+      "양천구",
+      "영등포구",
+      "용산구",
+      "은평구",
+      "종로구",
+      "중구",
+      "중랑구"
+    ],
+    "station_group": [
+      "업무지구",
+      "역세권",
+      "주거지"
+    ],
+    "holiday_type": [
+      "election",
+      "statutory",
+      "substitute",
+      "temporary"
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "settings": "V6 입력 + city 수준 보정 + LightGBM poisson, 2022~2025 학습(고정 횟수)",
+  "rounds": {
+    "rentals": 5528,
+    "returns": 7538
+  },
+  "train_rows": {
+    "rentals": 2097945,
+    "returns": 2097945
+  },
+  "data_end": "2025-12-31",
+  "max_target_date": "2026-12-30",
+  "min_target_date": "2026-01-01",
+  "h1_ratio_2026": {
+    "rentals": 0.958,
+    "returns": 0.9627
+  },
+  "alpha": 0.5,
+  "h2_factor_2026": {
+    "rentals": 0.9788,
+    "returns": 0.9812
+  },
+  "test_2025": {
+    "rentals_MAE": 1.444,
+    "returns_MAE": 1.431,
+    "rentals_Bias": 0.191,
+    "note": "배포 모델이 아닌 2022~2023 학습 모델의 테스트 결과"
+  },
+  "holiday_sources": [
+    "https://kholidayz.com/year/2026 (2026-11-16 확인)",
+    "https://mobile.newsis.com/view/NISX20260428_0003608893 (노동절·제헌절 공휴일)"
+  ],
+  "h1_source": "서울특별시 공공자전거 대여소별 이용정보(월별) 2025·2026 1~6월 (서울 열린데이터광장 OA-15249)",
+  "weather_note": "학습은 실측 날씨. 앱은 기상청 예보 연결 전까지 사용자가 입력한 날씨 가정(기본값은 평년값)을 쓴다."
+}

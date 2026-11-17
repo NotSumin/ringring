@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .env
 instance/
+backup/
+# Streamlit 비밀키 (API 키) — Git에 올리지 않음
+.streamlit/secrets.toml
