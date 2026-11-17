@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from folium.plugins import PolyLineTextPath   # 이동 흐름 화살표의 방향 표시(►)
 from streamlit_folium import st_folium
 
 # [역할] C안(날짜 예측) 모듈. [원리] 1년 전 기록 + 유사일 + 날씨 가정 + 달력으로 2026년 하루를 예측한다(longterm_c.py 참고).
@@ -41,6 +42,7 @@ MAX_DAYS_AHEAD = 365  # 날짜 선택 가능 범위: 오늘 ~ 1년 뒤 (기존 '
 #        C안은 팀 목표(7일 이내 날짜 선택)에 맞춰 오늘부터 7일까지만 고를 수 있고, 데이터 끝(2025-12-31)에서 364일 뒤까지만 가능하다.
 # [추가 2026-11-17] 1번 메뉴 이름(여러 곳에서 같은 글자를 써야 해서 상수로 둔다)
 MENU1 = "1. 대여소 현황 지도 (예측)"
+MENU5 = "5. 재배치 도우미 (따릉이 재배치 담당자용)"   # [추가 2026-11-17]
 METHOD_LT = "날짜 예측 (작년 기록 + 날씨 · 추천)"
 METHOD_REPLAY = "과거 같은 요일 재생 (1시간 모델 · 비교용)"
 LT_MODEL_DIR = MODEL_DIR / "longterm_c"
@@ -245,6 +247,118 @@ STATION_TYPES_FILE = DATA_DIR / "station_types.csv"
 STATION_TYPES_META = DATA_DIR / "station_types_meta.json"
 
 
+# [추가 2026-11-17 시간대별 이용 가능성] 내 대여소 카드에 '작년 기록 기준 빌리기·반납하기 가능성'을 시간대별로 보여 준다.
+# [역할] 실시간 앱에 없는 '몇 시에 가면 수월한가'를 알려 준다(출발 시각·대여소 고르기에 도움).
+# [원리] scripts/build_station_use_freq.py가 만든 작년(2025) 빈도표를 읽는다.
+#        고른 날짜 d → 작년 기준일(d − 364일)·날 종류(평일 / 주말·공휴일)·시각으로 찾아,
+#        빈도 < 0.3 🟢, < 0.6 🟠, 그 이상 🔴. 비교한 날이 5일 미만이면 판정하지 않는다.
+#        검증(2023→2024, 2024→2025): 대여 🟢일 때 실제로 빈 비율 11%, 🔴 62~63% / 반납(거치대 1.5배 이상) 🟢 15%, 🔴 70~73%.
+#        그날 날씨·예측은 섞지 않는다(섞으면 검증에서 오히려 덜 맞았다).
+USE_FREQ_FILE = DATA_DIR / "station_use_freq.parquet"
+USE_RENT_TEXT = ["🟢 수월해요", "🟠 빠듯할 수 있어요", "🔴 자전거가 없을 수 있어요"]
+USE_RETURN_TEXT = ["🟢 심하게 붐비진 않아요", "🟠 붐빌 수 있어요", "🔴 매우 붐빌 수 있어요"]
+
+
+@st.cache_data(show_spinner=False)
+def load_use_freq():
+    if not USE_FREQ_FILE.exists():
+        return None
+    f = pd.read_parquet(USE_FREQ_FILE)
+    f["station_id"] = f["station_id"].astype(str)
+    return f.set_index(["station_id", "hour", "kind", "ref_date"])
+
+
+@st.cache_data(show_spinner=False)
+def load_holiday_set():
+    path = LT_DATA_DIR / "holidays.csv"
+    return set(pd.read_csv(path)["date"]) if path.exists() else set()
+
+
+def use_level(freq):
+    return 2 if freq >= 0.6 else 1 if freq >= 0.3 else 0
+
+
+# [추가 2026-11-17 대여소 검색] 표를 대여소 이름·옛 이름·번호로 찾아 좁혀 보는 기능.
+# [역할] 60곳 표에서 내 대여소를 바로 찾게 한다. 개명 전 이름(예: '청구역')이나 따릉이 앱에 보이는 번호로도 찾을 수 있다.
+# [원리] 대여소마다 '검색용 글자'(지금 이름 + 2021년 이름 + 2026년 이름 + 번호)를 띄어쓰기 없이 소문자로 만들어 두고,
+#        검색어도 같은 방식으로 바꿔 '포함되는지'만 본다. 그래서 '3번 출구'와 '3번출구'가 같게 찾아진다.
+def _norm(text):
+    return "".join(str(text).split()).lower()
+
+
+@st.cache_data(show_spinner=False)
+def load_station_search_text():
+    """결과: station_id → 검색용 글자. 이름표 파일(station_names_2026.csv)이 없으면 지금 이름과 번호만 쓴다."""
+    st_df = read_stations_csv()[["station_id", "station_name"]]
+    words = {sid: [name, sid] for sid, name in zip(st_df["station_id"], st_df["station_name"])}
+    names_path = DATA_DIR / "station_names_2026.csv"
+    if names_path.exists():
+        nm = pd.read_csv(names_path, encoding="utf-8-sig", dtype={"station_id": str})
+        for _, row in nm.iterrows():
+            words.setdefault(row["station_id"], []).extend([row.get("name_2021", ""), row.get("name_2026", "")])
+    return {sid: _norm(" ".join(str(w) for w in ws if pd.notna(w))) for sid, ws in words.items()}
+
+
+def station_search(df, key, id_col="대여소ID"):
+    """[역할] 검색칸을 그리고, 검색어와 맞는 대여소만 남긴 표를 돌려준다. 검색어가 없으면 그대로 돌려준다."""
+    q = st.text_input("🔎 대여소 검색", key=key, placeholder="이름·옛 이름·번호 (예: 천호역, 청구역, 1012)",
+                      help="띄어쓰기는 무시해요. 이름이 바뀐 대여소는 옛 이름으로도 찾을 수 있어요.")
+    if not q.strip():
+        return df
+    text = load_station_search_text()
+    nq = _norm(q)
+    found = df[df[id_col].astype(str).map(lambda sid: nq in text.get(sid, ""))]
+    if found.empty:
+        st.caption(f"'{q}'와(과) 맞는 대여소가 없어요. 분석 대상은 서울 따릉이 대여소 중 60곳이라, 찾는 대여소가 없을 수도 있어요.")
+    else:
+        st.caption(f"'{q}' 검색 결과 {len(found)}곳")
+    return found
+
+
+def times_text(freq, what):
+    """[역할] 빈도를 쉬운 말로. [원리] 10번 중 0번·10번은 어색해 '거의 없었어요'·'거의 매번'으로 바꾼다."""
+    n = round(freq * 10)
+    if n == 0:
+        return f"작년엔 {what}인 적이 거의 없었어요"
+    if n == 10:
+        # 받침 있는 글자(예: '이상') 뒤에는 '이었어요', 없으면(예: '이하') '였어요'
+        ending = "이었어요" if (ord(what[-1]) - 0xAC00) % 28 else "였어요"
+        return f"작년엔 거의 매번 {what}{ending}"
+    return f"작년 10번 중 {n}번은 {what}"
+
+
+def show_use_forecast(station_id, date, hours):
+    """[역할] 고른 대여소의 시간대별 빌리기·반납하기 가능성 표를 그린다. 빈도표가 없으면 아무것도 그리지 않는다."""
+    freq = load_use_freq()
+    if freq is None:
+        return
+    kind = "off" if (date.weekday() >= 5 or date.strftime("%Y-%m-%d") in load_holiday_set()) else "work"
+    ref = pd.Timestamp(date) - pd.Timedelta(days=364)
+    rows = ["| 시간대 | 🚲 빌리기 | 🅿️ 반납하기 |", "|---|---|---|"]
+    for h in hours:
+        key = (str(station_id), h, kind, ref)
+        if key not in freq.index or freq.loc[key, "n_ref"] < 5:
+            rows.append(f"| {h}시대 | 기록이 적어 판단하기 어려워요 | - |")
+            continue
+        fe, fc = float(freq.loc[key, "f_empty"]), float(freq.loc[key, "f_crowd"])
+        rows.append(f"| {h}시대 ({h}:00~{h}:59) | {USE_RENT_TEXT[use_level(fe)]}<br>"
+                    f"<small>{times_text(fe, '3대 이하')}</small> | "
+                    f"{USE_RETURN_TEXT[use_level(fc)]}<br><small>{times_text(fc, '거치대의 1.5배 이상')}</small> |")
+    kind_text = "평일" if kind == "work" else "주말·공휴일"
+    st.markdown(f"##### ⏱️ 시간대별 이용 가능성 (작년 이 시기 {kind_text} 실제 기록 기준)")
+    st.markdown("\n".join(rows), unsafe_allow_html=True)
+    st.caption(
+        "작년 같은 시기(앞뒤 4주) 같은 날 종류의 실제 재고로 판정했어요. 지난 두 해로 시험해 보니, 빌리기 🟢일 때 실제로 빈 경우는 "
+        "약 10번 중 1번, 🔴일 때는 10번 중 6번쯤이었어요. 반납하기의 '매우 붐빔'은 자전거가 거치대의 1.5배 이상 쌓인 상태로, "
+        "그래도 다른 자전거에 연결해 반납할 수 있어요(🟢도 '자리 있음'이 아니라 '심하게 붐비진 않음'이에요). "
+        "날씨나 그날 상황은 반영하지 않아 평일끼리는 비슷한 결과가 나와요. 지도의 '포화(거치대 거의 참)'와는 기준이 달라요.")
+    names_path = DATA_DIR / "station_names_2026.csv"
+    if names_path.exists():
+        note = pd.read_csv(names_path, encoding="utf-8-sig", dtype={"station_id": str}).set_index("station_id")["note"]
+        if "위치 이전 여부 미확인" in str(note.get(str(station_id), "")):
+            st.caption("⚠️ 이 대여소는 2026년에 이름이 바뀌어, 작년 기록과 지금 위치가 다를 수 있어요.")
+
+
 @st.cache_data(show_spinner=False)
 def load_station_types():
     if not (STATION_TYPES_FILE.exists() and STATION_TYPES_META.exists()):
@@ -327,7 +441,8 @@ def sidebar_station_picker(disabled=False, where=None):
         "📍 대여소 선택",
         ["전체 대여소"] + sorted(lookup),
         disabled=disabled,
-        help="1번 지도는 고른 대여소로 확대되고, 2번 메뉴에는 '내 대여소 카드'가, 3번 그래프에는 그 대여소만 나옵니다. "
+        help="1번 지도는 고른 대여소로 확대되고, 2번 메뉴에는 '내 대여소 카드'가, 3번 그래프에는 그 대여소만 나오며, "
+             "5번 이동 흐름의 기준 대여소가 됩니다. "
              "4번 길찾기에서는 쓰지 않습니다.",
     )
     return None if choice == "전체 대여소" else lookup[choice]
@@ -857,6 +972,7 @@ mode = st.sidebar.radio(
         "2. 대여소 유형 지도 (출퇴근 흐름별)",
         "3. 시간대별 대여·반납 예측 그래프",
         "4. 가까운 대여소 길찾기",
+        MENU5,   # [추가 2026-11-17] 재배치 담당자용 화면 분리
     ],
 )
 
@@ -1103,7 +1219,7 @@ def map_key(prefix, selected):
 #        지도 원 크기는 |증감|의 제곱근에 비례(큰 값 몇 개가 화면을 덮지 않게).
 def render_flow_forecast(df_predicted, info):
     window_text = f"{day_text(selected_date)} {period_label} ({info['hour_min']:02d}~{info['hour_max']:02d}시)"
-    st.markdown(f"#### 🔴🔵 대여·반납 흐름 예보 (운영자용) — {window_text}")
+    st.markdown(f"#### 🔴🔵 대여·반납 흐름 예보 (재배치 담당자용) — {window_text}")
     st.caption("대여소마다 이 시간대에 자전거가 얼마나 빠져나가고 들어올지(예측 대여·반납) 보여 줍니다. 재배치 우선순위를 정할 때 참고하세요.")
 
     fc = df_predicted.copy()
@@ -1182,6 +1298,176 @@ def render_flow_forecast(df_predicted, info):
         st.caption("빠져나가는 순서로 정렬했어요. 재고 상태(부족·거치대 거의 참)는 작년 평균 재고로 추정한 값이라 참고로만 보세요.")
         if info["has_actual"]:
             st.caption(f"참조일 실제 증감: 참조일({info['ref_date']}) 같은 시간대의 실제 값으로, 예측과 비교하는 용도입니다.")
+
+
+# [추가 2026-11-17 이동 흐름 = 서비스 목표 3] 고른 대여소에서 빌린 자전거가 어디로 가는지(또는 어디서 오는지) 화살표로 보여 준다.
+# [역할] 운영자가 대여소 하나를 기준으로 "자전거가 어느 방향으로 빠져나가고 어디서 들어오는지" 보고 회수·보충 경로를 정하게 한다.
+# [원리] scripts/build_od_shares.py가 2025년 이동 기록으로 만든 '상위 10곳 비율표'(평일/주말·공휴일 × 출근/퇴근)를 읽고,
+#        예상 대수 = 비율 × 그날 이 대여소의 예측 대여 수(나가는 흐름) 또는 예측 반납 수(들어오는 흐름).
+#        검증(2024 비율 → 2025): 상위 10곳 중 약 7곳이 그대로였고, 경로별 대수 오차 약 25~32%(상관 0.95) → '방향을 보는' 용도.
+#        60곳에서 빌린 자전거의 90% 이상이 60곳 밖으로 가므로, 서울 전체 대여소 좌표로 상대를 그린다(60곳 밖은 예측 없이 위치만).
+#        권역(구) 단위는 재배치에 쓰기엔 너무 넓다는 사용자 판단에 따라 대여소 단위로 만든다. 날씨는 반영하지 않는다(검증 안 함).
+OD_FILE = DATA_DIR / "od_top_partners.csv"
+
+
+@st.cache_data(show_spinner=False)
+def load_od():
+    if not OD_FILE.exists():
+        return None
+    od = pd.read_csv(OD_FILE, encoding="utf-8-sig", dtype={"station_id": str, "partner_id": str})
+    return od
+
+
+def render_od_flow(df_predicted, info):
+    od = load_od()
+    window_text = f"{day_text(selected_date)} {period_label} ({info['hour_min']:02d}~{info['hour_max']:02d}시)"
+    st.markdown(f"#### 🔀 이동 흐름 (재배치 담당자용) — {window_text}")
+    if od is None:
+        st.info("이동 비율표(data/od_top_partners.csv)가 없습니다. scripts/build_od_shares.py로 만들어 주세요.")
+        return
+    names = df_predicted.set_index("대여소ID")["대여소명"]
+    ids = sorted(names.index, key=lambda s: names[s])
+    default = ids.index(selected_station_id) if selected_station_id in ids else 0
+    c1, c2, c3 = st.columns([2, 2, 1.4])
+    sid = c1.selectbox("기준 대여소", ids, index=default, format_func=lambda s: names[s], key="od_station",
+                       help="사이드바에서 대여소를 고르면 그 대여소가 기본으로 선택돼요.")
+    dir_label = c2.segmented_control("흐름", ["나가는 흐름", "들어오는 흐름"], default="나가는 흐름", key="od_dir") or "나가는 흐름"
+    # [추가 2026-11-17] 표시 개수 조절: 화살표가 많아 복잡할 때 상위 3·5곳만 보게 한다.
+    top_n = int((c3.segmented_control("표시", ["3곳", "5곳", "10곳"], default="10곳", key="od_topn") or "10곳").rstrip("곳"))
+    out = dir_label == "나가는 흐름"
+    kind = "off" if (selected_date.weekday() >= 5 or selected_date.strftime("%Y-%m-%d") in load_holiday_set()) else "work"
+    rows = od[(od.station_id == str(sid)) & (od.direction == ("out" if out else "in"))
+              & (od.period == PERIOD_OPTIONS[period_label]) & (od.kind == kind)].sort_values("rank")
+    covered_all = float(rows["share"].sum())   # 상위 10곳 전체 비중(표시 개수와 관계없이 안내용)
+    rows = rows[rows["rank"] <= top_n]
+    me = df_predicted[df_predicted["대여소ID"] == sid].iloc[0]
+    if rows.empty:
+        st.caption("이 조건의 이동 기록이 없어요.")
+        return
+    base = float(me["예측_대여"] if out else me["예측_반납"])
+    rows = rows.assign(예상=rows["share"] * base,
+                       거리_m=haversine_m(me["위도"], me["경도"], rows["partner_lat"].to_numpy(float), rows["partner_lon"].to_numpy(float)))
+    # [수정 2026-11-17 식별성] 화살표가 많으면 한 색으로는 구분이 어려워, 비율 단계별 색(진함 → 옅음) + 도착지 순위 번호(표와 같은 번호)로 구분한다.
+    # [원리] 비율 15% 이상 = 주요 흐름(진한 색), 5~15% = 중간, 5% 미만 = 옅은 회색. 나가는 흐름은 빨강 계열, 들어오는 흐름은 파랑 계열.
+    tiers = ([("15% 이상", 0.15, "#a50f15"), ("5~15%", 0.05, "#fb6a4a"), ("5% 미만", 0.0, "#bdbdbd")] if out else
+             [("15% 이상", 0.15, "#08519c"), ("5~15%", 0.05, "#6baed6"), ("5% 미만", 0.0, "#bdbdbd")])
+
+    def tier_of(share):
+        return next(t for t in tiers if share >= t[1])
+
+    st.caption(f"{'빌려 갈' if out else '반납될'} 자전거 예측 약 {base:.0f}대 중, "
+               f"{'어디로 가는지' if out else '어디서 오는지'} 작년({int(rows['base_year'].iloc[0])}년) "
+               f"{'평일' if kind == 'work' else '주말·공휴일'} 같은 시간대 비율로 나눴어요.")
+
+    # 범례: 비율 단계 색 + 번호 설명
+    st.markdown(" &nbsp; ".join(f"<span style='color:{c};font-size:1.3em'>━</span> {label}" for label, _, c in tiers)
+                + " &nbsp; <span style='color:#888'>· 굵기 = 오늘 예상 대수 · 동그라미 번호 = 아래 표의 순위</span>",
+                unsafe_allow_html=True)
+    # 지도: 기준 대여소 ↔ 상위 N곳 화살표. 굵기 = 예상 대수(가장 큰 것 기준 2~12px), 색 = 비율 단계, '►'로 방향 표시.
+    # 옅은 선을 먼저, 진한 선을 나중에 그려 주요 흐름이 위에 보이게 한다.
+    pts = [[me["위도"], me["경도"]]] + rows[["partner_lat", "partner_lon"]].values.tolist()
+    center, zoom = fit_view(pts, padding_px=90)   # 여백을 넉넉히: 기준 대여소(★)가 지도 가장자리에 잘리지 않게
+    m = folium.Map(location=center, zoom_start=zoom)
+    top = max(float(rows["예상"].max()), 1e-9)
+    for _, r in rows.sort_values("share").iterrows():
+        a, b = [me["위도"], me["경도"]], [r["partner_lat"], r["partner_lon"]]
+        c = tier_of(float(r["share"]))[2]
+        line = folium.PolyLine([a, b] if out else [b, a], color=c, weight=2 + 10 * float(r["예상"]) / top, opacity=0.85,
+                               tooltip=f"{r['rank']}위 {r['partner_name']} · 약 {r['예상']:.1f}대 ({r['share'] * 100:.0f}%)")
+        line.add_to(m)
+        PolyLineTextPath(line, "  ►  ", repeat=True, offset=5, attributes={"fill": c, "font-size": "12"}).add_to(m)
+        # 도착(출발) 대여소 위치에 순위 번호 동그라미(표의 '순위'와 같음). 60곳 대상은 테두리를 굵게.
+        border = "3px solid #222" if r["partner_in_60"] else "1px solid #fff"
+        folium.Marker(b, tooltip=f"{r['rank']}위 {r['partner_name']}{' (분석 대상 60곳)' if r['partner_in_60'] else ''}",
+                      icon=folium.DivIcon(icon_size=(22, 22), icon_anchor=(11, 11), html=(
+                          f"<div style='width:22px;height:22px;border-radius:11px;background:{c};border:{border};"
+                          f"color:#fff;font-weight:700;font-size:12px;line-height:20px;text-align:center;"
+                          f"box-shadow:0 0 2px #000'>{int(r['rank'])}</div>"))).add_to(m)
+    folium.Marker([me["위도"], me["경도"]], tooltip=f"기준: {me['대여소명']}",
+                  icon=folium.Icon(color="black", icon="star", prefix="glyphicon")).add_to(m)
+    st_folium(m, width="100%", height=430, returned_objects=[],
+              key=f"od_map_{sid}_{dir_label}_{top_n}_{selected_date}_{period_label}")
+
+    covered = covered_all
+    # 표에 비율 단계를 같은 색 이름으로 보여 줘 지도 색과 맞춰 볼 수 있게 한다.
+    dots = {t[0]: d for t, d in zip(tiers, ["🟥" if out else "🟦", "🟧" if out else "🔹", "⬜"])}
+    table = rows.assign(대상=np.where(rows["partner_in_60"], "60곳", "-"),
+                        단계=[f"{dots[tier_of(float(s))[0]]} {tier_of(float(s))[0]}" for s in rows["share"]])[
+        ["rank", "partner_name", "단계", "대상", "예상", "share", "per_day", "거리_m"]].rename(columns={
+        "rank": "순위", "partner_name": "도착 대여소" if out else "출발 대여소", "예상": "오늘 예상",
+        "share": "비율", "per_day": "작년 하루 평균", "거리_m": "거리(직선)"})
+    st.dataframe(table, hide_index=True, width="stretch", column_config={
+        "오늘 예상": st.column_config.NumberColumn(format="%.1f대", help="비율 × 그날 이 대여소의 예측 대여(반납) 수"),
+        "비율": st.column_config.NumberColumn(format="percent", help="작년 같은 조건에서 전체 중 이 대여소로(에서) 간 비율"),
+        "작년 하루 평균": st.column_config.NumberColumn(format="%.1f대"),
+        "거리(직선)": st.column_config.NumberColumn(format="%.0fm"),
+        "대상": st.column_config.TextColumn(help="60곳 = 분석 대상(예측 있음), - = 60곳 밖(위치만, 예측 없음)"),
+    })
+    st.caption(f"상위 10곳이 전체의 약 {covered * 100:.0f}%예요. 나머지 {100 - covered * 100:.0f}%는 여러 곳으로 조금씩 흩어져요. "
+               "작년 비율로 다음 해를 맞혀 보면 상위 10곳 중 약 7곳이 그대로였고 경로별 대수는 25~32% 정도 틀려, "
+               "정확한 대수보다 '흐르는 방향'을 보는 용도예요. 화살표는 직선이고, 날씨는 반영하지 않아요.")
+
+
+NEAR_WARN_M = 2000   # 이 거리 안에 대상 대여소가 하나도 없으면 '멀다'고 알린다
+
+
+def nearest_sort(df):
+    """[역할] 주소·장소 입력칸을 그리고, 그 위치에서 가까운 순으로 정렬한 표(거리_m 열 추가)를 돌려준다.
+    [원리] 버튼을 눌렀을 때만 카카오를 부른다(입력할 때마다 호출하지 않게). 키가 없거나 검색에 실패하면 원래 표를 그대로 돌려준다."""
+    if not kakao_key():
+        st.info("가까운 순 정렬에는 카카오 API 키(KAKAO_REST_KEY)가 필요해요. 키가 없어 원래 순서로 보여 드려요.")
+        return df
+    with st.form("near_form", border=False):
+        # key를 고정해야 한다: 기본값(value)을 바꿔 가며 넘기면 입력칸이 새로 만들어져 방금 입력한 글자가 사라진다.
+        q = st.text_input("📍 기준 위치", placeholder="주소나 장소 이름 (예: 천호역, 서울 강동구 천호대로 1005)",
+                          key="near_input")
+        if st.form_submit_button("가까운 순으로 보기"):
+            st.session_state["near_query"] = q.strip()
+    query = st.session_state.get("near_query", "")
+    if not query:
+        st.caption("기준 위치를 입력하고 '가까운 순으로 보기'를 눌러 주세요.")
+        return df
+    place = pick_place("기준 위치", query, st)
+    if place is None:
+        return df
+    out = df.assign(거리_m=haversine_m(place["lat"], place["lon"],
+                                      df["위도"].to_numpy(dtype=float), df["경도"].to_numpy(dtype=float)))
+    out = out.sort_values("거리_m")
+    if not out.empty and out["거리_m"].iloc[0] > NEAR_WARN_M:
+        st.warning(f"'{place['name']}' 근처 2km 안에는 분석 대상 대여소가 없어요. 가장 가까운 곳도 약 "
+                   f"{fmt_distance(out['거리_m'].iloc[0])} 떨어져 있어요(분석 대상 60곳 기준).")
+    else:
+        st.caption(f"'{place['name']}'에서 직선거리로 가까운 순이에요. 실제 길은 더 길 수 있어요.")
+    return out
+
+
+# [수정 2026-11-17] 4번 메뉴 안에 있던 함수를 밖으로 옮겼다. 1번 메뉴의 '가까운 순' 정렬에서도 같이 쓰기 위해서다(동작은 그대로).
+def pick_place(label, query, col):
+    """카카오 검색 → 결과가 여러 개면 고르게 한다. 실패하면 이유를 보여 주고 None."""
+    try:
+        results = kakao_search(query)
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", None)
+        if code in (401, 403):
+            col.error(
+                f"카카오 API 키가 올바르지 않거나 사용 권한이 없습니다(오류 {code}). "
+                "secrets.toml의 키와 카카오 개발자 사이트의 앱 설정을 확인해 주세요."
+            )
+        else:
+            col.warning(f"'{query}' 검색에 실패했습니다(오류 {code}). 잠시 후 다시 시도해 주세요.")
+        return None
+    except Exception:
+        col.warning(f"'{query}' 검색 중 카카오 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.")
+        return None
+    if not results:
+        col.warning(f"'{query}' 검색 결과가 없습니다. 다른 이름이나 주소로 검색해 주세요.")
+        return None
+    labels = [f"{r['name']} · {r['address']}" if r["address"] else r["name"] for r in results]
+    idx = col.selectbox(
+        f"{label} 검색 결과", range(len(results)), format_func=lambda i: labels[i],
+        key=f"pick_{label}_{query}",
+    )
+    return results[idx]
 
 
 # ==========================================
@@ -1287,15 +1573,34 @@ if mode == MENU1:   # [수정 2026-11-17] 출퇴근 예보 시도 후 사용자 
         table_cols = ["대여소명", "순수요_NetFlow", "위험상태"]
         if info["has_actual"]:
             table_cols.insert(2, "실제_NetFlow")
-        table = df_predicted[table_cols].copy()
+        # [추가 2026-11-17] 검색칸: 이름·옛 이름·번호로 표를 좁혀 본다(지도는 그대로 전체)
+        base = station_search(df_predicted, key="search_m1")
+        # [추가 2026-11-17 정렬·가까운 순] 표 순서를 고른다. '가까운 순'은 주소·장소를 검색해 그 위치에서 직선거리 순으로 놓는다.
+        # [원리] 4번 메뉴와 같은 카카오 검색(pick_place)으로 위치를 찾고, haversine_m으로 대여소까지 직선거리를 잰다.
+        #        GPS 대신 주소를 쓰는 이유: 위치 권한 팝업·PC 위치 부정확·새 부품 설치 없이 동작한다.
+        #        대상이 60곳뿐이라 가까운 곳이 멀 수 있어, 2km 안에 없으면 그렇다고 알려 준다.
+        sort_by = st.segmented_control("표 정렬", ["모자란 순", "가까운 순", "이름순"], default="모자란 순",
+                                       key="sort_m1", help="모자란 순: 증감이 작은(자전거가 많이 빠져나가는) 대여소부터")
+        if sort_by == "가까운 순":
+            base = nearest_sort(base)
+            if "거리_m" in base.columns:
+                table_cols.insert(1, "거리_m")
+            else:   # 위치를 못 찾았으면 기본 순서(모자란 순)로 보여 준다
+                base = base.sort_values("순수요_NetFlow")
+        elif sort_by == "이름순":
+            base = base.sort_values("대여소명")
+        else:   # 모자란 순(기본, 버튼을 다시 눌러 선택을 지운 경우 포함)
+            base = base.sort_values("순수요_NetFlow")
+        table = base[table_cols].copy()
         for c in ("순수요_NetFlow", "실제_NetFlow"):
             if c in table.columns:
                 table[c] = table[c].round(1)
         # [수정 2026-11-17] 열 이름을 쉬운 말로, 숫자는 그대로 두고 '+/−대' 형식으로 표시(머리글 정렬 유지)
         net_col, act_col = "증감 (+남음/−모자람)", "참조일 실제 증감"
         table = table.rename(columns={"대여소명": "대여소", "순수요_NetFlow": net_col,
-                                      "실제_NetFlow": act_col, "위험상태": "상태"})
+                                      "실제_NetFlow": act_col, "위험상태": "상태", "거리_m": "거리(직선)"})
         st.dataframe(one_based(table), width="stretch", height=400, column_config={
+            "거리(직선)": st.column_config.NumberColumn(format="%.0fm", help="고른 위치에서 대여소까지 직선거리(실제 길은 더 길어요)"),
             net_col: st.column_config.NumberColumn(format="%+.1f대",
                                                    help="시간대 동안 (예측 반납 − 예측 대여). +면 자전거가 남고, −면 모자랍니다."),
             act_col: st.column_config.NumberColumn(format="%+.1f대"),
@@ -1423,6 +1728,8 @@ elif mode == "2. 대여소 유형 지도 (출퇴근 흐름별)":
                             f"빌려 가는 자전거 약 {r['예측_대여']:.0f}대 · 반납 약 {r['예측_반납']:.0f}대  \n"
                             f"끝날 때 남은 자전거: **{inv_text(r['예측_잔여수량'], r['총거치대수'])}** (거치대 {int(r['총거치대수'])}석, 추정)  \n"
                             f"상태: **{r['위험상태']}**")
+            # [추가 2026-11-17] 고른 출퇴근 시간대의 3개 시각별 빌리기·반납하기 가능성(작년 실제 기록 기준)
+            show_use_forecast(r["대여소ID"], selected_date, list(range(info["hour_min"], info["hour_max"] + 1)))
             risk_now = str(r["위험상태"])
             if risk_now.startswith("부족") or risk_now.startswith("포화"):
                 bad = "부족" if risk_now.startswith("부족") else "포화"
@@ -1432,7 +1739,8 @@ elif mode == "2. 대여소 유형 지도 (출퇴근 흐름별)":
                 what = "빌릴 자전거가 모자랄 수 있어요" if bad == "부족" else "거치대가 거의 차서 다른 자전거에 연결해 반납해야 할 수 있어요"
                 # 대안 설명은 목적에 맞게: 빌릴 때는 남을 자전거 수, 반납할 때는 '거치대 여유'(자전거가 적을수록 자리가 많음)
                 def alt_note(a):
-                    return (f"자전거 약 {int(a['예측_잔여수량'])}대 남을 예정" if bad == "부족"
+                    # [수정 2026-11-17] 거치대를 넘는 예측은 숫자 대신 '거치대 초과'(inv_text)
+                    return (f"남을 자전거 {inv_text(a['예측_잔여수량'], a['총거치대수'])}" if bad == "부족"
                             else f"거치대 여유 있음, 거치대 {int(a['총거치대수'])}석")
                 tip = (" 가까운 대안: " + ", ".join(f"**{a['대여소명']}**({fmt_distance(a['거리'])}, {alt_note(a)})"
                                                   for _, a in alt.iterrows())) if len(alt) else " 1.5km 안에 대안 대여소가 없어요(분석 대상 60곳 기준)."
@@ -1456,76 +1764,6 @@ elif mode == "2. 대여소 유형 지도 (출퇴근 흐름별)":
             st.markdown(f"평소 퇴근(18~20시): {flow_text(t['pm_return_per_rental'])}")
             if s:
                 st.markdown(f"**오늘 {period_word} 예측:** {net_text(s['net'])}")
-
-    # ⑤ 운영자 보기 (2단계, 기본 닫힘)
-    # [역할] 운영·재배치 담당자가 '어느 구·유형이 문제인지'와 '어디서 빼서 어디로 보낼지'를 본다.
-    # [원리] (가) 자치구 × 유형 표: 예측표를 묶어 평균 (반납-대여), 부족·포화 수를 센다.
-    #        (나) 옮길 방향 후보: 부족 위험 대여소마다, 예측 끝 재고가 거치대 수 이상으로 남는 대여소 중
-    #             직선거리로 가까운 2곳을 짝지어 보여 준다. 대수·트럭 경로는 계산하지 않는다(방향 제안).
-    # [수정 2026-11-17] 접기 메뉴 → 켜기 스위치 + 선택 버튼. [왜] 접힌 칸 안에서 그린 지도는 펼쳤을 때 회색으로 깨지기 쉽고,
-    #        세 가지 운영 화면을 한꺼번에 펼치면 너무 길다. [원리] 스위치를 켰을 때만, 고른 화면 하나만 그린다(계산도 그때만).
-    if st.toggle("🛠️ 운영자 보기 (재배치 담당자용)", key="op_view",
-                 help="구·유형별 현황, 옮길 방향 후보, 대여·반납 흐름 예보를 볼 수 있어요."):
-        op_view = st.segmented_control("운영자 화면", ["구·유형 현황", "옮길 방향 후보", "흐름 예보"],
-                                       default="구·유형 현황", key="op_tab", label_visibility="collapsed")
-        if op_view == "구·유형 현황":
-            st.markdown("**(가) 자치구 × 유형별 오늘 예측**")
-            gt = d.assign(부족=d["위험상태"].str.startswith("부족"), 포화=d["위험상태"].str.startswith("포화"),
-                          유형=d["type_emoji"].fillna("") + " " + d["type_name"].fillna("미분류"))
-            # [수정 2026-11-17 표 이름 정리] 열 이름을 쉬운 말로 바꾸고 단위(곳·대)를 붙이며, 결론을 '추천 방향' 한 칸으로 준다.
-            # [원리] 증감은 숫자 그대로 두고(머리글로 정렬 가능) 표시 형식만 +/−와 '대'로 바꾼다(st.column_config).
-            #        추천 방향 규칙: 부족 예상이 있으면 🚚 재배치 받기 / 대여소당 +3대 이상 남고 거치대 거의 참이 있으면 📦 수거 후 재배치 / 그 밖 ✅ 유지.
-            #        3대는 '눈에 띄게 남는 수준'으로 정한 값(가정)이다. 정렬은 🚚 → 📦 → ✅, 그 안에서 많이 모자란/남는 순.
-            gt = (gt.groupby(["클러스터", "유형"])
-                    .agg(n=("대여소ID", "count"), net=("순수요_NetFlow", "mean"),
-                         short=("부족", "sum"), full=("포화", "sum"), chronic=("상시과밀", "sum"))
-                    .reset_index())
-            gt["net"] = gt["net"].round(1)
-            gt["추천 방향"] = np.select(
-                [gt["short"] > 0, (gt["net"] >= 3) & (gt["full"] > 0)],
-                ["🚚 재배치 받기 (보충 필요)", "📦 수거 후 재배치 (여유분 이동)"], default="✅ 유지")
-            rank = gt["추천 방향"].str[0].map({"🚚": 0, "📦": 1, "✅": 2})
-            gt = gt.assign(_r=rank, _k=np.where(rank == 1, -gt["net"], gt["net"])).sort_values(["_r", "_k"])
-            gt = gt[["클러스터", "유형", "n", "net", "추천 방향", "short", "full", "chronic"]].rename(columns={
-                "클러스터": "자치구", "n": "대여소 수", "net": "대여소당 증감 (+남음/−모자람)",
-                "short": "자전거 부족 예상", "full": "거치대 거의 참", "chronic": "평소에도 넘침"})
-            st.dataframe(one_based(gt), width="stretch", height=300, column_config={
-                "대여소 수": st.column_config.NumberColumn(format="%d곳"),
-                "대여소당 증감 (+남음/−모자람)": st.column_config.NumberColumn(
-                    format="%+.1f대", help="대여소 한 곳당 평균 (예측 반납 − 예측 대여). +면 자전거가 남고, −면 모자랍니다."),
-                "추천 방향": st.column_config.TextColumn(
-                    help="🚚 부족 예상 대여소가 있음 → 다른 곳에서 가져와 채우기 / 📦 대여소당 3대 이상 남고 거치대가 거의 참 → 남는 자전거를 거둬 옮기기 / ✅ 손댈 필요 없음"),
-                "자전거 부족 예상": st.column_config.NumberColumn(format="%d곳", help="끝날 때 남은 자전거가 3대 이하로 예측된 대여소 수"),
-                "거치대 거의 참": st.column_config.NumberColumn(format="%d곳", help="끝날 때 자전거가 거치대 수 − 3대 이상으로 예측된 대여소 수(반납은 연결 반납으로 가능)"),
-                "평소에도 넘침": st.column_config.NumberColumn(format="%d곳", help="2025년 평소(중앙값) 재고가 거치대 수보다 많은 대여소 수"),
-            })
-            st.caption("열 이름에 마우스를 올리면 설명이 나옵니다. 급한 순서(🚚 → 📦 → ✅)로 정렬했습니다.")
-        elif op_view == "옮길 방향 후보":
-            st.markdown("**(나) 옮길 방향 후보** — 🚚 재배치 받을 곳 ← 가까운 📦 수거할 곳")
-            need = d[d["위험상태"].str.startswith("부족")]
-            have = d[d["예측_잔여수량"] >= d["총거치대수"]]
-            pairs = []
-            for _, n in need.iterrows():
-                h = have.assign(거리=haversine_m(n["위도"], n["경도"], have["위도"].to_numpy(float), have["경도"].to_numpy(float)))
-                for _, s in h.nsmallest(2, "거리").iterrows():
-                    # [수정 2026-11-17] 열 이름을 🚚 받을 곳 / 📦 수거할 곳으로 통일하고 숫자에 단위 '대'를 붙인다.
-                    pairs.append({"🚚 재배치 받을 곳": f"{n['대여소명']} ({n['클러스터']})", "받을 곳: 남을 자전거": int(n["예측_잔여수량"]),
-                                  "📦 수거할 곳": f"{s['대여소명']} ({s['클러스터']})",
-                                  "수거할 곳: 남을 자전거": inv_text(s["예측_잔여수량"], s["총거치대수"]),
-                                  "수거할 곳: 거치대": int(s["총거치대수"]), "거리(직선)": fmt_distance(s["거리"])})
-            if pairs:
-                st.dataframe(one_based(pd.DataFrame(pairs)), width="stretch", column_config={
-                    "받을 곳: 남을 자전거": st.column_config.NumberColumn(format="%d대", help="시간대가 끝날 때 남을 것으로 예측한 자전거 수"),
-                    "수거할 곳: 남을 자전거": st.column_config.TextColumn(
-                        help="거치대 수를 넘는 예측은 숫자가 과장일 수 있어(실제로는 그 전에 재배치됨) '거치대 초과'로만 표시합니다."),
-                    "수거할 곳: 거치대": st.column_config.NumberColumn(format="%d석"),
-                })
-            else:
-                st.caption("이 시간대에는 부족 위험 대여소가 없거나, 자전거가 남는 대여소가 없습니다.")
-            st.caption("방향 제안일 뿐이며 옮길 대수·차량 경로는 계산하지 않습니다. 📦 수거할 곳 = 끝날 때 자전거가 거치대 수 이상 남을 곳. "
-                       "직선거리 기준이라 실제 이동 거리는 더 깁니다. 분석 대상 60곳 안에서만 짝을 찾습니다.")
-        elif op_view == "흐름 예보":
-            render_flow_forecast(df_predicted, info)
 
     # ⑥ 분석 방법 — [원리] 쉬운 설명 아래에 근거를 작게 남겨 발표·검증 때 확인할 수 있게 한다.
     # [수정 2026-11-17] 한 문단 설명 → 항목별 목록. 실루엣 점수 수준 해석, 유형 고정·카드 숫자(중앙값) 설명을 더했다.
@@ -1558,6 +1796,87 @@ elif mode == "2. 대여소 유형 지도 (출퇴근 흐름별)":
             f"- 유형 카드의 '평소 출근·퇴근' 숫자(예: 1대 나갈 때 5.9대 들어와요)는 그 유형 대여소들의 **중앙값**이에요.\n"
             f"- {tmeta['note']}"
         )
+
+# ------------------------------------------
+# Mode 5: 재배치 도우미 (따릉이 재배치 담당자용)
+# ------------------------------------------
+# [수정 2026-11-17 메뉴 분리] 2번 메뉴 안 '운영자 보기' 스위치에 있던 화면들을 별도 메뉴로 옮겼다(사용자 결정).
+# [왜] 2번은 이용자용(내 대여소가 어떤 곳인지)이고, 이 화면들은 재배치 담당자용이라 대상이 다르다. '운영자'는 서비스 운영자로
+#      오해될 수 있어 '따릉이 재배치 담당자'로 부른다. 누구나 볼 수 있다(로그인 없음).
+# [역할] (가) 구·유형 현황 (나) 옮길 방향 후보 (다) 흐름 예보 (라) 이동 흐름 화살표 중 하나를 골라 본다.
+# [원리] 2번 메뉴와 같은 예측(get_predictions)과 대여소 유형표를 합친 표(d)를 쓰고, 고른 화면 하나만 그린다.
+elif mode == MENU5:
+    df_predicted, info = get_predictions()
+    types, tmeta = load_station_types()
+    st.subheader("🚚 재배치 도우미 — 따릉이 재배치 담당자를 위한 화면")
+    st.caption("어느 구·유형에서 자전거가 모자라거나 남는지, 어디서 어디로 옮기면 좋을지, 자전거가 어디로 흐르는지 볼 수 있어요. "
+               "재배치 담당자를 위한 화면이지만 누구나 볼 수 있어요.")
+    if types is None:
+        st.error("대여소 유형 파일(data/station_types.csv)이 없습니다. scripts/build_station_types.py로 만들어 주세요.")
+        st.stop()
+    d = df_predicted.merge(types, left_on="대여소ID", right_on="station_id", how="left")
+    op_view = st.segmented_control("재배치 도우미 화면", ["구·유형 현황", "옮길 방향 후보", "흐름 예보", "이동 흐름"],
+                                   default="구·유형 현황", key="op_tab", label_visibility="collapsed")
+    if op_view == "구·유형 현황":
+        st.markdown("**(가) 자치구 × 유형별 오늘 예측**")
+        gt = d.assign(부족=d["위험상태"].str.startswith("부족"), 포화=d["위험상태"].str.startswith("포화"),
+                      유형=d["type_emoji"].fillna("") + " " + d["type_name"].fillna("미분류"))
+        # [수정 2026-11-17 표 이름 정리] 열 이름을 쉬운 말로 바꾸고 단위(곳·대)를 붙이며, 결론을 '추천 방향' 한 칸으로 준다.
+        # [원리] 증감은 숫자 그대로 두고(머리글로 정렬 가능) 표시 형식만 +/−와 '대'로 바꾼다(st.column_config).
+        #        추천 방향 규칙: 부족 예상이 있으면 🚚 재배치 받기 / 대여소당 +3대 이상 남고 거치대 거의 참이 있으면 📦 수거 후 재배치 / 그 밖 ✅ 유지.
+        #        3대는 '눈에 띄게 남는 수준'으로 정한 값(가정)이다. 정렬은 🚚 → 📦 → ✅, 그 안에서 많이 모자란/남는 순.
+        gt = (gt.groupby(["클러스터", "유형"])
+                .agg(n=("대여소ID", "count"), net=("순수요_NetFlow", "mean"),
+                     short=("부족", "sum"), full=("포화", "sum"), chronic=("상시과밀", "sum"))
+                .reset_index())
+        gt["net"] = gt["net"].round(1)
+        gt["추천 방향"] = np.select(
+            [gt["short"] > 0, (gt["net"] >= 3) & (gt["full"] > 0)],
+            ["🚚 재배치 받기 (보충 필요)", "📦 수거 후 재배치 (여유분 이동)"], default="✅ 유지")
+        rank = gt["추천 방향"].str[0].map({"🚚": 0, "📦": 1, "✅": 2})
+        gt = gt.assign(_r=rank, _k=np.where(rank == 1, -gt["net"], gt["net"])).sort_values(["_r", "_k"])
+        gt = gt[["클러스터", "유형", "n", "net", "추천 방향", "short", "full", "chronic"]].rename(columns={
+            "클러스터": "자치구", "n": "대여소 수", "net": "대여소당 증감 (+남음/−모자람)",
+            "short": "자전거 부족 예상", "full": "거치대 거의 참", "chronic": "평소에도 넘침"})
+        st.dataframe(one_based(gt), width="stretch", height=300, column_config={
+            "대여소 수": st.column_config.NumberColumn(format="%d곳"),
+            "대여소당 증감 (+남음/−모자람)": st.column_config.NumberColumn(
+                format="%+.1f대", help="대여소 한 곳당 평균 (예측 반납 − 예측 대여). +면 자전거가 남고, −면 모자랍니다."),
+            "추천 방향": st.column_config.TextColumn(
+                help="🚚 부족 예상 대여소가 있음 → 다른 곳에서 가져와 채우기 / 📦 대여소당 3대 이상 남고 거치대가 거의 참 → 남는 자전거를 거둬 옮기기 / ✅ 손댈 필요 없음"),
+            "자전거 부족 예상": st.column_config.NumberColumn(format="%d곳", help="끝날 때 남은 자전거가 3대 이하로 예측된 대여소 수"),
+            "거치대 거의 참": st.column_config.NumberColumn(format="%d곳", help="끝날 때 자전거가 거치대 수 − 3대 이상으로 예측된 대여소 수(반납은 연결 반납으로 가능)"),
+            "평소에도 넘침": st.column_config.NumberColumn(format="%d곳", help="2025년 평소(중앙값) 재고가 거치대 수보다 많은 대여소 수"),
+        })
+        st.caption("열 이름에 마우스를 올리면 설명이 나옵니다. 급한 순서(🚚 → 📦 → ✅)로 정렬했습니다.")
+    elif op_view == "옮길 방향 후보":
+        st.markdown("**(나) 옮길 방향 후보** — 🚚 재배치 받을 곳 ← 가까운 📦 수거할 곳")
+        need = d[d["위험상태"].str.startswith("부족")]
+        have = d[d["예측_잔여수량"] >= d["총거치대수"]]
+        pairs = []
+        for _, n in need.iterrows():
+            h = have.assign(거리=haversine_m(n["위도"], n["경도"], have["위도"].to_numpy(float), have["경도"].to_numpy(float)))
+            for _, s in h.nsmallest(2, "거리").iterrows():
+                # [수정 2026-11-17] 열 이름을 🚚 받을 곳 / 📦 수거할 곳으로 통일하고 숫자에 단위 '대'를 붙인다.
+                pairs.append({"🚚 재배치 받을 곳": f"{n['대여소명']} ({n['클러스터']})", "받을 곳: 남을 자전거": int(n["예측_잔여수량"]),
+                              "📦 수거할 곳": f"{s['대여소명']} ({s['클러스터']})",
+                              "수거할 곳: 남을 자전거": inv_text(s["예측_잔여수량"], s["총거치대수"]),
+                              "수거할 곳: 거치대": int(s["총거치대수"]), "거리(직선)": fmt_distance(s["거리"])})
+        if pairs:
+            st.dataframe(one_based(pd.DataFrame(pairs)), width="stretch", column_config={
+                "받을 곳: 남을 자전거": st.column_config.NumberColumn(format="%d대", help="시간대가 끝날 때 남을 것으로 예측한 자전거 수"),
+                "수거할 곳: 남을 자전거": st.column_config.TextColumn(
+                    help="거치대 수를 넘는 예측은 숫자가 과장일 수 있어(실제로는 그 전에 재배치됨) '거치대 초과'로만 표시합니다."),
+                "수거할 곳: 거치대": st.column_config.NumberColumn(format="%d석"),
+            })
+        else:
+            st.caption("이 시간대에는 부족 위험 대여소가 없거나, 자전거가 남는 대여소가 없습니다.")
+        st.caption("방향 제안일 뿐이며 옮길 대수·차량 경로는 계산하지 않습니다. 📦 수거할 곳 = 끝날 때 자전거가 거치대 수 이상 남을 곳. "
+                   "직선거리 기준이라 실제 이동 거리는 더 깁니다. 분석 대상 60곳 안에서만 짝을 찾습니다.")
+    elif op_view == "흐름 예보":
+        render_flow_forecast(df_predicted, info)
+    elif op_view == "이동 흐름":   # [추가 2026-11-17] 목표 3: 대여 후 반납 위치 이동 화살표
+        render_od_flow(df_predicted, info)
 
 # ------------------------------------------
 # Mode 3: 시간대별 대여·반납 예측 (선 그래프)
@@ -1636,32 +1955,6 @@ elif mode == "4. 가까운 대여소 길찾기":
         st.info("출발지와 도착지를 모두 입력하고 '대여소 찾기'를 눌러 주세요.")
         st.stop()
 
-    def pick_place(label, query, col):
-        """카카오 검색 → 결과가 여러 개면 고르게 한다. 실패하면 이유를 보여 주고 None."""
-        try:
-            results = kakao_search(query)
-        except requests.HTTPError as e:
-            code = getattr(e.response, "status_code", None)
-            if code in (401, 403):
-                col.error(
-                    f"카카오 API 키가 올바르지 않거나 사용 권한이 없습니다(오류 {code}). "
-                    "secrets.toml의 키와 카카오 개발자 사이트의 앱 설정을 확인해 주세요."
-                )
-            else:
-                col.warning(f"'{query}' 검색에 실패했습니다(오류 {code}). 잠시 후 다시 시도해 주세요.")
-            return None
-        except Exception:
-            col.warning(f"'{query}' 검색 중 카카오 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.")
-            return None
-        if not results:
-            col.warning(f"'{query}' 검색 결과가 없습니다. 다른 이름이나 주소로 검색해 주세요.")
-            return None
-        labels = [f"{r['name']} · {r['address']}" if r["address"] else r["name"] for r in results]
-        idx = col.selectbox(
-            f"{label} 검색 결과", range(len(results)), format_func=lambda i: labels[i],
-            key=f"pick_{label}_{query}",
-        )
-        return results[idx]
 
     p1, p2 = st.columns(2)
     origin = pick_place("출발지", q_origin, p1)
