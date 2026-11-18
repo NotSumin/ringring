@@ -79,7 +79,7 @@
 
 - 수요 예측 대시보드 구현  
 - 사용자 친화적 UI 제공  
-- HuggingFace Spaces 배포  
+- Streamlit Community Cloud 배포  
 
 ---
 
