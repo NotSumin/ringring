@@ -1,0 +1,75 @@
+{
+  "method": "K-Means (표준화한 특징 4개, k=4, seed 42, n_init 20)",
+  "period": "2025년 평일(공휴일 제외)",
+  "features": [
+    "am_ratio",
+    "pm_ratio",
+    "log_volume",
+    "peak_share"
+  ],
+  "feature_ko": {
+    "am_ratio": "출근 07~09시 (반납-대여)/(반납+대여)",
+    "pm_ratio": "퇴근 18~20시 같은 계산",
+    "log_volume": "하루 평균 이용 건수(로그)",
+    "peak_share": "하루 이용 중 출퇴근 6시간 비율"
+  },
+  "silhouette_by_k": {
+    "2": 0.343,
+    "3": 0.323,
+    "4": 0.334,
+    "5": 0.29,
+    "6": 0.265
+  },
+  "k": 4,
+  "note": "유형 이름은 이용 흐름으로 붙인 별명이며, 실제 토지 용도(회사·주거)를 확인한 것은 아니에요. 예측 모델에 쓴 대여소 구분(역 주변·회사·주거, 2021~2023년 기록 기준)과는 별개의 분류예요.",
+  "types": [
+    {
+      "emoji": "🏠",
+      "name": "출근길 출발지 (주거 지역)",
+      "color": "#1f77b4",
+      "desc": "아침에 자전거를 타고 나가고 저녁에 돌아와요. 출근 시간엔 자전거가, 퇴근 시간엔 반납 자리가 모자라기 쉬워요.",
+      "key": "home",
+      "n_stations": 20,
+      "am_return_per_rental": 0.28,
+      "pm_return_per_rental": 1.97,
+      "daily_volume": 78.0,
+      "peak_share": 0.44
+    },
+    {
+      "emoji": "🏢",
+      "name": "출근길 도착지 (회사 밀집)",
+      "color": "#d62728",
+      "desc": "아침에 자전거가 많이 들어오고 저녁에 빠져나가요. 출근 시간엔 반납 자리가, 퇴근 시간엔 자전거가 모자라기 쉬워요.",
+      "key": "office",
+      "n_stations": 9,
+      "am_return_per_rental": 5.86,
+      "pm_return_per_rental": 0.27,
+      "daily_volume": 115.0,
+      "peak_share": 0.55
+    },
+    {
+      "emoji": "🏬",
+      "name": "출근길 도착지 (회사·생활 혼합)",
+      "color": "#ff7f0e",
+      "desc": "아침엔 자전거가 들어오는 편이지만, 낮에도 꾸준히 쓰여 회사 밀집 지역보다 덜 쏠려요.",
+      "key": "mixed",
+      "n_stations": 16,
+      "am_return_per_rental": 2.35,
+      "pm_return_per_rental": 0.68,
+      "daily_volume": 102.0,
+      "peak_share": 0.41
+    },
+    {
+      "emoji": "🚇",
+      "name": "하루 종일 붐비는 곳 (역 앞 등)",
+      "color": "#9467bd",
+      "desc": "들고 나는 양이 비슷하지만 이용 자체가 가장 많아요. 자전거가 빨리 바뀌므로 도착 직전에 한 번 더 확인하세요.",
+      "key": "busy",
+      "n_stations": 15,
+      "am_return_per_rental": 0.82,
+      "pm_return_per_rental": 1.11,
+      "daily_volume": 207.0,
+      "peak_share": 0.47
+    }
+  ]
+}
