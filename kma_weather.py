@@ -15,6 +15,7 @@ import os
 import re
 from datetime import date, datetime, timedelta
 from urllib.parse import unquote
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -210,7 +211,11 @@ def mid_daily(land, ta, tmfc):
 def fetch_forecast(key, now=None):
     """[역할] 단기·중기예보를 받아 날짜별 날씨 표(dict)와 출처 설명을 돌려준다.
     [원리] 단기예보를 우선 쓰고, 단기예보에 없는 날짜만 중기예보로 채운다. 한쪽이 실패해도 다른 쪽은 쓴다."""
-    now = now or datetime.now()
+    # [수정 2026-11-18 한국 시간 기준] 기상청 발표 시각(base_time·tmFc)은 한국 시간이다.
+    # [왜] datetime.now()는 서버 컴퓨터의 시계를 따른다. PC는 한국 시간이지만 Streamlit Cloud 같은 서버는 보통 UTC라
+    #      9시간 이른 발표분을 고르게 되어, 예보가 최대 9시간 늦어질 수 있었다.
+    # [원리] 서버 위치와 관계없이 한국 시간(Asia/Seoul)의 현재 시각을 구하고, 아래 계산이 시간대 없는 값을 쓰므로 시간대 표시만 뗀다.
+    now = now or datetime.now(ZoneInfo('Asia/Seoul')).replace(tzinfo=None)
     result, notes = {}, []
     # [수정] 가장 최근 발표분 + (그게 오늘 02시가 아니면) 오늘 02시 발표분도 받는다.
     #        최근 발표분을 우선 쓰고, 거기서 빠진 '오늘'처럼 하루가 다 안 담긴 날만 02시 발표분으로 채운다.

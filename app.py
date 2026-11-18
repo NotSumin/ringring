@@ -328,19 +328,27 @@ def times_text(freq, what):
 
 
 def show_use_forecast(station_id, date, hours):
-    """[역할] 고른 대여소의 시간대별 빌리기·반납하기 가능성 표를 그린다. 빈도표가 없으면 아무것도 그리지 않는다."""
+    """[역할] 고른 대여소의 시간대별 빌리기·반납하기 가능성 표를 그린다. 빈도표가 없으면 아무것도 그리지 않는다.
+    [수정 2026-11-18] 🔴(어려움)인 시각 목록을 돌려준다: {"rent": [빌리기 🔴 시각], "return": [반납하기 🔴 시각]}.
+    [왜] 카드 맨 아래 안내가 위쪽 예측 상태만 보고 '큰 문제 없음'이라고 하는데, 이 표에는 🔴가 있는 경우가 있었다(다음 7일 예측의 약 7%).
+         안내 문구가 이 표의 🔴도 함께 보고 정하도록 결과를 넘겨준다. 빈도표가 없으면 None."""
     freq = load_use_freq()
     if freq is None:
-        return
+        return None
     kind = "off" if (date.weekday() >= 5 or date.strftime("%Y-%m-%d") in load_holiday_set()) else "work"
     ref = pd.Timestamp(date) - pd.Timedelta(days=364)
     rows = ["| 시간대 | 🚲 빌리기 | 🅿️ 반납하기 |", "|---|---|---|"]
+    red = {"rent": [], "return": []}
     for h in hours:
         key = (str(station_id), h, kind, ref)
         if key not in freq.index or freq.loc[key, "n_ref"] < 5:
             rows.append(f"| {h}시대 | 기록이 적어 판단하기 어려워요 | - |")
             continue
         fe, fc = float(freq.loc[key, "f_empty"]), float(freq.loc[key, "f_crowd"])
+        if use_level(fe) == 2:
+            red["rent"].append(h)
+        if use_level(fc) == 2:
+            red["return"].append(h)
         rows.append(f"| {h}시대 ({h}:00~{h}:59) | {USE_RENT_TEXT[use_level(fe)]}<br>"
                     f"<small>{times_text(fe, '3대 이하')}</small> | "
                     f"{USE_RETURN_TEXT[use_level(fc)]}<br><small>{times_text(fc, '거치대의 1.5배 이상')}</small> |")
@@ -357,6 +365,7 @@ def show_use_forecast(station_id, date, hours):
         note = pd.read_csv(names_path, encoding="utf-8-sig", dtype={"station_id": str}).set_index("station_id")["note"]
         if "위치 이전 여부 미확인" in str(note.get(str(station_id), "")):
             st.caption("⚠️ 이 대여소는 2026년에 이름이 바뀌어, 작년 기록과 지금 위치가 다를 수 있어요.")
+    return red
 
 
 @st.cache_data(show_spinner=False)
@@ -382,12 +391,21 @@ def inv_text(inv, dock):
     """[역할] 예측 끝 재고를 화면용 글로. [원리] 예측 재고는 상한 없이 계산해 거치대를 크게 넘을 수 있지만(예: 108대),
     실제로는 그 전에 재배치가 일어나 숫자 자체는 과장일 수 있다. 그래서 거치대 수를 넘으면 숫자 대신
     '거치대 초과'로만 알리고, 넘지 않으면 '약 N대'로 보여 준다(판정에는 원래 숫자를 그대로 쓴다)."""
+    # [수정 2026-11-18 숫자 대신 구간 (B)]
+    # [왜] 2024·2025년 검증에서 예측 끝 재고는 실제와 평균 약 10대 차이가 났다(실제 평균 17~19대). '약 7대'처럼 쓰면
+    #      정확한 값처럼 보이므로, 숫자 대신 판정 기준과 같은 경계로 나눈 구간 이름을 보여 준다.
+    # [원리] 3대 이하 '거의 없음' / 거치대 절반 미만 '적은 편' / 거치대 − 3 미만 '넉넉한 편' / 거치대까지 '거치대 거의 참' / 넘으면 '거치대 초과'.
     if pd.isna(inv) or pd.isna(dock):
         return "-"
-    # 거치대 수는 보통 옆에 따로 표시하므로 여기서는 반복하지 않는다. 0대는 '약'을 붙이지 않는다.
     if inv > dock:
         return "거치대 초과"
-    return "0대" if inv <= 0 else f"약 {int(inv)}대"
+    if inv <= 3:
+        return "거의 없음"
+    if inv < dock / 2:
+        return "적은 편"
+    if inv < dock - 3:
+        return "넉넉한 편"
+    return "거치대 거의 참"
 
 
 def flow_text(ratio):
@@ -541,12 +559,49 @@ def load_chronic_full():
     return h.groupby(h["station_id"].astype(str))["inventory"].median()
 
 
+# [추가 2026-11-18 부족 판정 보강 (A)]
+# [역할] '자전거 부족 예상'이 실제 부족을 많이 놓치던 문제를 줄인다.
+# [왜] 2024·2025년 검증(experiments/longterm_c/eval_status_accuracy.py)에서 예측 재고만 보는 판정은 실제 부족의
+#      32~42%만 잡았다(시작 재고로 쓰는 작년 평균이 부정확해서). 재고 추정을 쓰지 않는 '작년 빈도'와 둘 중 하나라도
+#      위험하면 부족으로 보면 잡는 비율이 55~63%로 오르고, 맞는 비율은 52~56%로 비슷했다(F1 0.41~0.49 → 0.53~0.59, 두 해 같은 결과).
+# [원리] 작년 빈도 = 작년 같은 시기(고른 날 − 364일 ± 28일)·같은 날 종류(평일 / 주말·공휴일)에, 시간대가 끝난 직후 시각
+#        (출근 10시, 퇴근 21시)의 재고가 3대 이하였던 날의 비율. 비교한 날이 5일 미만인 대여소는 빈도를 쓰지 않는다.
+#        빈도 ≥ 0.5(작년 이 시기 절반 이상의 날)면 '작년 기록상 부족'. 0.5는 검증 전에 정한 값이다.
+@st.cache_data(show_spinner=False)
+def _end_hour_inventory():
+    """결과: 출퇴근이 끝난 직후 시각(10·21시)의 작년 재고표(station_id, day, hour, inventory). 파일이 없으면 빈 표."""
+    path = LT_DATA_DIR / "history_hourly.parquet"
+    if not path.exists():
+        return pd.DataFrame(columns=["station_id", "day", "hour", "inventory"])
+    h = pd.read_parquet(path, columns=["station_id", "timestamp", "inventory"]).dropna(subset=["inventory"])
+    ts = h["timestamp"].dt.tz_localize(None)
+    h = h.assign(station_id=h["station_id"].astype(str), day=ts.dt.normalize(), hour=ts.dt.hour)
+    return h[h["hour"].isin([10, 21])][["station_id", "day", "hour", "inventory"]]
+
+
+@st.cache_data(show_spinner=False)
+def last_year_short_freq(date, end_h):
+    """결과: station_id → 작년 이 시기 끝 시각 재고가 3대 이하였던 날의 비율(비교일 5일 이상인 대여소만)."""
+    h = _end_hour_inventory()
+    h = h[h["hour"] == end_h]
+    ref = pd.Timestamp(date) - pd.Timedelta(days=364)
+    h = h[(h["day"] - ref).abs() <= pd.Timedelta(days=28)]
+    hol = load_holiday_set()
+    off = (h["day"].dt.day_of_week >= 5) | h["day"].dt.strftime("%Y-%m-%d").isin(hol)
+    target_off = date.weekday() >= 5 or date.strftime("%Y-%m-%d") in hol
+    g = (h.loc[off == target_off, "inventory"] <= 3).groupby(h.loc[off == target_off, "station_id"])
+    n, f = g.size(), g.mean()
+    return f[n >= 5]
+
+
 # [역할] 시간별 예측(sub)을 대여소별 표(지도·표·길찾기에서 쓰는 형태)로 요약한다.
 # [원리] 피크 시간대 3시간의 예측 대여·반납을 더하고, 시간대 시작 재고 + (반납 - 대여)로 끝날 때 재고를 추정해
 #        3대 이하면 부족, 거치대 수 - 3 이상이면 포화(거치대 거의 참)로 표시한다. 기존 1시간 모델과 C안(날짜 예측)이 함께 쓰도록 run_prediction에서 분리했다.
 #        sub에 필요한 열: station_id, timestamp, hour, latitude, longitude, dock_count, inventory_lag_1h, pred_rentals, pred_returns
 #        (실제값 열·기상 열은 있으면 쓰고 없으면 건너뛴다)
-def summarize_period(sub, model_name):
+# [수정 2026-11-18] short_freq(작년 빈도, last_year_short_freq 결과)를 받으면 부족 판정에 함께 쓴다(날짜 예측일 때만 넘긴다).
+#        같은 요일 재생(비교용)은 참조일이 과거라 '작년 빈도'를 만들 자료가 없어 예전 규칙 그대로 둔다.
+def summarize_period(sub, model_name, short_freq=None):
     sub = sub.sort_values(["station_id", "timestamp"])
     # 대여소별로 피크 시간대 전체(시간별 예측의 합)를 집계
     spec = {
@@ -584,12 +639,21 @@ def summarize_period(sub, model_name):
     out["평소재고"] = usual.round()
     out["상시과밀"] = (usual > out["총거치대수"]).fillna(False).astype(bool)
 
+    # [수정 2026-11-18 부족 판정 보강] 부족 = 예측 끝 재고 ≤ 3대 '또는' 작년 빈도 ≥ 0.5 (위 last_year_short_freq 설명 참고).
+    #        어느 근거로 부족이 됐는지(부족근거)를 남겨 카드·지도 설명에 쓴다.
+    out["부족_작년빈도"] = (out["station_id"].astype(str).map(short_freq) if short_freq is not None else np.nan)
+    pred_short = out["예측_잔여수량"] <= 3
+    freq_short = (out["부족_작년빈도"] >= 0.5).fillna(False).astype(bool)
+    out["부족근거"] = np.select([pred_short & freq_short, pred_short, freq_short],
+                              ["예측·작년 기록", "예측", "작년 기록"], default="")
     conditions = [
-        (out["예측_잔여수량"] <= 3),
+        pred_short | freq_short,
         (out["예측_잔여수량"] >= out["총거치대수"] - 3),
     ]
     # [수정 2026-11-17] '반납 불가'는 과장 → 거치대가 거의 차서 다른 자전거에 연결해 반납해야 할 수 있다는 뜻으로.
-    choices = ["부족 위험 🔴 (대여 불가)", "포화 위험 🔵 (거치대 거의 참)"]
+    # [수정 2026-11-18] '대여 불가'는 예측을 단정하는 말이라 '자전거 거의 없음'으로 바꿈(판정 범위를 넓힌 뒤 더 어색해져서).
+    #        화면 곳곳은 앞부분('부족'·'포화')으로 상태를 구분하므로 괄호 안 문구만 바꿔도 동작은 같다.
+    choices = ["부족 위험 🔴 (자전거 거의 없음)", "포화 위험 🔵 (거치대 거의 참)"]
     out["위험상태"] = np.select(conditions, choices, default="정상 🟢")
     out["적용모델"] = model_name
 
@@ -679,7 +743,9 @@ def run_prediction_lt(date, period_label, weather_items, model_name="LightGBM"):
     static = load_lt_bundle().static[["station_id", "latitude", "longitude", "dock_count"]]
     sub = day[day["commute_period"] == PERIOD_OPTIONS[period_label]].merge(static, on="station_id", how="left")
     sub = sub.rename(columns={"inventory_ly": "inventory_lag_1h"})
-    out, info = summarize_period(sub, lt_name(model_name, star=False))   # [수정 2026-11-17] 화면용 이름
+    # [수정 2026-11-18] 시간대가 끝난 직후 시각(출근 10시·퇴근 21시)의 작년 부족 빈도를 함께 넘긴다(부족 판정 보강).
+    short_freq = last_year_short_freq(date, int(sub["hour"].max()) + 1)
+    out, info = summarize_period(sub, lt_name(model_name, star=False), short_freq)   # [수정 2026-11-17] 화면용 이름
     info["similar_dates"] = sims
     return out, info
 
@@ -719,13 +785,35 @@ def _kma_forecast_cached(time_bucket):
     return table, notes
 
 
+# [추가 2026-11-18 기상청 실패 잠시 기억]
+# [역할] 기상청 서버가 응답 없이 멈출 때, 화면을 누를 때마다 다시 기다리느라 앱이 느려지는 것을 막는다.
+# [왜] 실패는 캐시하지 않으므로(위 설명) 매 클릭마다 최대 4번 × 8초(약 30초)를 기다릴 수 있었다.
+# [원리] 마지막 실패 시각과 이유를 앱 전체가 함께 쓰는 상자(st.cache_resource)에 적어 두고,
+#        KMA_RETRY_AFTER_S(5분) 안에는 기상청을 다시 부르지 않고 바로 평년값으로 넘어간다. 5분이 지나면 다시 시도한다.
+#        성공하면 상자를 비운다. 키가 없을 때는 원래대로 바로 안내한다(기다림 없음).
+KMA_RETRY_AFTER_S = 300
+
+
+@st.cache_resource(show_spinner=False)
+def _kma_fail_box():
+    return {"at": 0.0, "reason": ""}
+
+
 def load_kma_forecast(time_bucket):
     """결과: (날짜별 예보 표, 실패 메모). 키가 없거나 실패하면 빈 표와 이유를 돌려준다."""
     if not kma.service_key():
         return {}, ["기상청 서비스 키(KMA_SERVICE_KEY)가 없습니다."]
+    box = _kma_fail_box()
+    wait = KMA_RETRY_AFTER_S - (time.time() - box["at"])
+    if wait > 0:
+        # 화면 안내는 앞 120자만 보이므로 '언제 다시 시도하는지'를 앞에 둔다.
+        return {}, [f"약 {max(1, round(wait / 60))}분 뒤 다시 시도해요", box["reason"]]
     try:
-        return _kma_forecast_cached(time_bucket)
+        result = _kma_forecast_cached(time_bucket)
+        box["at"], box["reason"] = 0.0, ""
+        return result
     except Exception as e:  # noqa: BLE001 — 이유를 화면 설명에 보여 준다
+        box["at"], box["reason"] = time.time(), str(e)
         return {}, [str(e)]
 
 
@@ -757,7 +845,10 @@ def show_lt_banner(sims):
         f"**참고하실 점**\n"
         f"- 실제와 시간당 평균 **약 {mae}대** 차이가 날 수 있어요(지난해 기록으로 시험한 결과).\n"
         f"- 실제보다 **{lean}** 예측하는 경향이 있어요.\n"
-        f"- 남은 자전거 수는 작년 같은 시각의 평균으로 추정한 값이라 실제와 다를 수 있어요."
+        # [수정 2026-11-18] 재고 추정 오차(평균 약 10대)와 구간 표시·부족 판정 보강을 알린다.
+        f"- 남은 자전거 수는 작년 같은 시각의 평균으로 추정해 실제와 평균 약 10대 차이가 나요. 그래서 숫자 대신 "
+        f"'거의 없음·적은 편·넉넉한 편'처럼 구간으로 보여 드려요.\n"
+        f"- '자전거 부족 예상'은 예측과 작년 이 시기 기록 중 하나라도 부족하면 표시해요(실제 부족을 더 많이 미리 알리기 위해서)."
     )
     # [추가 2026-11-17] 오늘 날짜를 고른 이용자는 '지금 재고'로 오해하기 쉬워 더 눈에 띄게 알린다.
     # [원리] 실시간 재고 API를 연결하지 않았으므로, 남은 자전거 수는 오늘도 작년 평균 기반 추정값이다.
@@ -780,6 +871,10 @@ def show_lt_banner(sims):
             lines.append(f"- **2025년 시험 결과(한 번만 평가):** 시간당 평균 오차 대여 {tst['rentals_MAE']:.3f}대 · 반납 "
                          f"{tst['returns_MAE']:.3f}대, 평균 치우침 대여 {tst['rentals_Bias']:+.3f}대(+는 많게 예측).")
         lines.append("- **남은 자전거 수:** 실시간 재고가 없으므로 작년 같은 시기 같은 시각의 평균 재고에 예측 (반납 − 대여)를 더해 추정합니다.")
+        # [추가 2026-11-18] 부족 판정 보강의 근거(검증 숫자)를 자세히 보기에 남긴다.
+        lines.append("- **자전거 부족 판정:** 예측 끝 재고 3대 이하 **또는** 작년 같은 시기(±4주)·같은 날 종류에 시간대가 끝날 때 "
+                     "3대 이하였던 날이 절반 이상. 2024·2025년 기록으로 시험했을 때 예측만 쓰면 실제 부족의 32~42%를 미리 잡았고, "
+                     "둘을 함께 쓰면 55~63%를 잡았어요(표시가 맞은 비율은 52~56%로 비슷). 남은 자전거 추정 오차는 평균 약 10대예요.")
         st.markdown("\n".join(lines))
     # [추가 2026-11-16 눈] 눈 예보일(전날 눈 포함) 불확실성 안내.
     # [원리] 학습 기간 5년(1,826일) 중 눈 추정일은 83일뿐이고, 모델은 적설량(1cm인지 10cm인지)을 모른다.
@@ -1408,6 +1503,16 @@ def render_od_flow(df_predicted, info):
                "정확한 대수보다 '흐르는 방향'을 보는 용도예요. 화살표는 직선이고, 날씨는 반영하지 않아요.")
 
 
+# [추가 2026-11-18 '모자란 순' 정렬 수정]
+# [역할] 1번 메뉴 표의 '모자란 순'에서 상태가 '부족 위험'인 대여소를 맨 위에 놓는다.
+# [왜] 예전에는 증감(반납 − 대여)만으로 정렬해, 많이 빠져나가도 원래 자전거가 많은 '정상' 대여소가 맨 위에 왔다.
+#      다음 7일 예측으로 세어 보니 맨 위 5곳 중 81%가 '부족'이 아니어서, 이름(모자란 순)과 표 내용이 어긋났다.
+# [원리] 1순위 = 부족 위험 여부(부족이 먼저), 2순위 = 증감이 작은(많이 빠져나가는) 순. 부족 대여소끼리도 증감 순으로 놓인다.
+def shortage_first(df):
+    key = (~df["위험상태"].str.startswith("부족")).astype(int)
+    return df.assign(_short_key=key).sort_values(["_short_key", "순수요_NetFlow"]).drop(columns="_short_key")
+
+
 NEAR_WARN_M = 2000   # 이 거리 안에 대상 대여소가 하나도 없으면 '멀다'고 알린다
 
 
@@ -1502,7 +1607,8 @@ if mode == MENU1:   # [수정 2026-11-17] 출퇴근 예보 시도 후 사용자 
             '<div class="stat"><div class="stat-label">대상 대여소</div>'
             f'<div class="stat-line"><span class="stat-value">{len(df_predicted)}곳</span></div></div>'
             '<div class="stat"><div class="stat-label">자전거 부족 예상 '
-            '<span class="stat-help" title="예측 잔여 자전거가 3대 이하라 대여가 어려운 대여소">?</span></div>'
+            # [수정 2026-11-18] 부족 판정 보강(예측 또는 작년 기록)에 맞춰 설명을 바꿈
+            '<span class="stat-help" title="끝날 때 남은 자전거가 3대 이하로 예측되거나, 작년 이 시기 절반 이상의 날에 3대 이하였던 대여소">?</span></div>'
             f'<div class="stat-line"><span class="stat-value">{shortage_cnt}곳</span>'
             '</div></div>'   # [수정 2026-11-17] 뜻이 모호한 '↓ -경고' 태그 제거
             '<div class="stat"><div class="stat-label">거치대 거의 참 '
@@ -1545,7 +1651,9 @@ if mode == MENU1:   # [수정 2026-11-17] 출퇴근 예보 시도 후 사용자 
                 f"• 예측 대여 {row['예측_대여']:.1f}대 / 반납 {row['예측_반납']:.1f}대<br>"
                 f"• 증감: {row['순수요_NetFlow']:+.1f}대 ({'남음' if row['순수요_NetFlow'] >= 0 else '모자람'})<br>"
                 # [수정 2026-11-17] 예측 잔여가 거치대 수를 넘을 수 있고, 평소에도 넘는 '상시 과밀' 대여소는 따로 알린다.
-                f"• <b>예측 잔여: {inv_text(row['예측_잔여수량'], row['총거치대수'])}</b> (거치대 {int(row['총거치대수'])}석)"
+                f"• <b>예측 잔여: {inv_text(row['예측_잔여수량'], row['총거치대수'])}</b> (거치대 {int(row['총거치대수'])}석, 추정)"
+                # [추가 2026-11-18] 작년 기록 때문에 부족이 된 경우 그 이유를 적는다(예측 잔여는 넉넉해 보여도 부족일 수 있으므로)
+                + ("<br>• 작년 이 시기엔 절반 이상의 날에 3대 이하였어요" if "작년" in str(row["부족근거"]) else "")
                 + (f"<br>• 상시 과밀: 평소에도 약 {int(row['평소재고'])}대가 놓여 있는 곳" if row["상시과밀"] else "")
                 + "</div>"
             )
@@ -1580,17 +1688,17 @@ if mode == MENU1:   # [수정 2026-11-17] 출퇴근 예보 시도 후 사용자 
         #        GPS 대신 주소를 쓰는 이유: 위치 권한 팝업·PC 위치 부정확·새 부품 설치 없이 동작한다.
         #        대상이 60곳뿐이라 가까운 곳이 멀 수 있어, 2km 안에 없으면 그렇다고 알려 준다.
         sort_by = st.segmented_control("표 정렬", ["모자란 순", "가까운 순", "이름순"], default="모자란 순",
-                                       key="sort_m1", help="모자란 순: 증감이 작은(자전거가 많이 빠져나가는) 대여소부터")
+                                       key="sort_m1", help="모자란 순: '자전거 부족 예상' 대여소를 맨 위에, 그다음 자전거가 많이 빠져나가는 순")
         if sort_by == "가까운 순":
             base = nearest_sort(base)
             if "거리_m" in base.columns:
                 table_cols.insert(1, "거리_m")
             else:   # 위치를 못 찾았으면 기본 순서(모자란 순)로 보여 준다
-                base = base.sort_values("순수요_NetFlow")
+                base = shortage_first(base)
         elif sort_by == "이름순":
             base = base.sort_values("대여소명")
         else:   # 모자란 순(기본, 버튼을 다시 눌러 선택을 지운 경우 포함)
-            base = base.sort_values("순수요_NetFlow")
+            base = shortage_first(base)
         table = base[table_cols].copy()
         for c in ("순수요_NetFlow", "실제_NetFlow"):
             if c in table.columns:
@@ -1727,9 +1835,13 @@ elif mode == "2. 대여소 유형 지도 (출퇴근 흐름별)":
                 st.markdown(f"**오늘 {period_label} 예측** ({selected_date:%m/%d})  \n"
                             f"빌려 가는 자전거 약 {r['예측_대여']:.0f}대 · 반납 약 {r['예측_반납']:.0f}대  \n"
                             f"끝날 때 남은 자전거: **{inv_text(r['예측_잔여수량'], r['총거치대수'])}** (거치대 {int(r['총거치대수'])}석, 추정)  \n"
-                            f"상태: **{r['위험상태']}**")
+                            f"상태: **{r['위험상태']}**"
+                            # [추가 2026-11-18] 부족 근거 표시: 작년 기록 때문이면 그 빈도를 쉬운 말로
+                            + (f"  \n<small>작년 이 시기 10번 중 {round(float(r['부족_작년빈도']) * 10)}번은 "
+                               f"시간대가 끝날 때 3대 이하였어요</small>"
+                               if "작년" in str(r["부족근거"]) else ""), unsafe_allow_html=True)
             # [추가 2026-11-17] 고른 출퇴근 시간대의 3개 시각별 빌리기·반납하기 가능성(작년 실제 기록 기준)
-            show_use_forecast(r["대여소ID"], selected_date, list(range(info["hour_min"], info["hour_max"] + 1)))
+            use_red = show_use_forecast(r["대여소ID"], selected_date, list(range(info["hour_min"], info["hour_max"] + 1)))
             risk_now = str(r["위험상태"])
             if risk_now.startswith("부족") or risk_now.startswith("포화"):
                 bad = "부족" if risk_now.startswith("부족") else "포화"
@@ -1745,6 +1857,18 @@ elif mode == "2. 대여소 유형 지도 (출퇴근 흐름별)":
                 tip = (" 가까운 대안: " + ", ".join(f"**{a['대여소명']}**({fmt_distance(a['거리'])}, {alt_note(a)})"
                                                   for _, a in alt.iterrows())) if len(alt) else " 1.5km 안에 대안 대여소가 없어요(분석 대상 60곳 기준)."
                 st.warning(f"💡 {what}.{tip} 길찾기는 메뉴 4에서 할 수 있어요.")
+            # [수정 2026-11-18 카드 안내 일치]
+            # [역할] 예측 상태는 '정상'이어도, 위 시간대 표에 🔴가 있으면 '큰 문제 없음' 대신 그 시각을 알려 준다.
+            # [원리] 예측 상태(예측 재고 기준)와 시간대 표(작년 실제 기록 기준)는 근거가 달라 엇갈릴 수 있다.
+            #        둘 중 하나라도 어렵다고 하면 '주의'로 안내하고, 둘 다 괜찮을 때만 '큰 문제 없음'으로 안내한다.
+            elif use_red and (use_red["rent"] or use_red["return"]):
+                parts = []
+                if use_red["rent"]:
+                    parts.append(f"{'·'.join(f'{h}시' for h in use_red['rent'])}대에는 자전거가 거의 없던 날이 많았어요")
+                if use_red["return"]:
+                    parts.append(f"{'·'.join(f'{h}시' for h in use_red['return'])}대에는 반납 자전거가 많이 쌓였던 날이 많았어요")
+                st.info("💡 예측으로는 큰 문제가 없지만, 작년 이 시기 기록으로는 " + ", ".join(parts) + ". "
+                        "그 시각에 이용한다면 근처 대여소도 함께 확인해 두세요.")
             else:
                 st.success("💡 오늘 이 시간대엔 큰 문제 없이 이용할 수 있을 것으로 보여요.")
 
@@ -1844,7 +1968,7 @@ elif mode == MENU5:
                 format="%+.1f대", help="대여소 한 곳당 평균 (예측 반납 − 예측 대여). +면 자전거가 남고, −면 모자랍니다."),
             "추천 방향": st.column_config.TextColumn(
                 help="🚚 부족 예상 대여소가 있음 → 다른 곳에서 가져와 채우기 / 📦 대여소당 3대 이상 남고 거치대가 거의 참 → 남는 자전거를 거둬 옮기기 / ✅ 손댈 필요 없음"),
-            "자전거 부족 예상": st.column_config.NumberColumn(format="%d곳", help="끝날 때 남은 자전거가 3대 이하로 예측된 대여소 수"),
+            "자전거 부족 예상": st.column_config.NumberColumn(format="%d곳", help="끝날 때 남은 자전거가 3대 이하로 예측되거나, 작년 이 시기 절반 이상의 날에 3대 이하였던 대여소 수"),
             "거치대 거의 참": st.column_config.NumberColumn(format="%d곳", help="끝날 때 자전거가 거치대 수 − 3대 이상으로 예측된 대여소 수(반납은 연결 반납으로 가능)"),
             "평소에도 넘침": st.column_config.NumberColumn(format="%d곳", help="2025년 평소(중앙값) 재고가 거치대 수보다 많은 대여소 수"),
         })
@@ -1858,13 +1982,17 @@ elif mode == MENU5:
             h = have.assign(거리=haversine_m(n["위도"], n["경도"], have["위도"].to_numpy(float), have["경도"].to_numpy(float)))
             for _, s in h.nsmallest(2, "거리").iterrows():
                 # [수정 2026-11-17] 열 이름을 🚚 받을 곳 / 📦 수거할 곳으로 통일하고 숫자에 단위 '대'를 붙인다.
-                pairs.append({"🚚 재배치 받을 곳": f"{n['대여소명']} ({n['클러스터']})", "받을 곳: 남을 자전거": int(n["예측_잔여수량"]),
+                # [수정 2026-11-18] 받을 곳의 남을 자전거도 숫자 대신 구간(inv_text)으로. 작년 기록으로 부족이 된 곳은 그 사실을 붙인다.
+                pairs.append({"🚚 재배치 받을 곳": f"{n['대여소명']} ({n['클러스터']})",
+                              "받을 곳: 남을 자전거": inv_text(n["예측_잔여수량"], n["총거치대수"])
+                              + (" · 작년 이 시기 자주 부족" if "작년" in str(n["부족근거"]) else ""),
                               "📦 수거할 곳": f"{s['대여소명']} ({s['클러스터']})",
                               "수거할 곳: 남을 자전거": inv_text(s["예측_잔여수량"], s["총거치대수"]),
                               "수거할 곳: 거치대": int(s["총거치대수"]), "거리(직선)": fmt_distance(s["거리"])})
         if pairs:
             st.dataframe(one_based(pd.DataFrame(pairs)), width="stretch", column_config={
-                "받을 곳: 남을 자전거": st.column_config.NumberColumn(format="%d대", help="시간대가 끝날 때 남을 것으로 예측한 자전거 수"),
+                "받을 곳: 남을 자전거": st.column_config.TextColumn(
+                    help="시간대가 끝날 때 남을 자전거(추정 구간). 추정 오차가 커서 숫자 대신 구간으로 보여 줍니다."),
                 "수거할 곳: 남을 자전거": st.column_config.TextColumn(
                     help="거치대 수를 넘는 예측은 숫자가 과장일 수 있어(실제로는 그 전에 재배치됨) '거치대 초과'로만 표시합니다."),
                 "수거할 곳: 거치대": st.column_config.NumberColumn(format="%d석"),
