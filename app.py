@@ -36,6 +36,7 @@ MODEL_OPTIONS = ["GRU", "LightGBM", "XGBoost"]
 PERIOD_OPTIONS = {"오전 출근": "morning", "오후 퇴근": "evening"}  # commute_period 값과 매칭
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 MAX_DAYS_AHEAD = 365  # 날짜 선택 가능 범위: 오늘 ~ 1년 뒤 (기존 '같은 요일 재생' 방식에서만 사용)
+CLUSTER_VIEW_HEIGHT = 450  # 2번 메뉴: 지도와 표의 높이(px). 둘을 같은 값으로 맞춘다.
 
 # [역할] 예측 방식 선택지와 C안 파일 위치.
 # [원리] 기본은 C안(실제 날짜 예측). 기존 1시간 모델의 '같은 요일 재생'은 비교용으로 남긴다.
@@ -98,7 +99,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🚲 AI 기반 따릉이 출퇴근 수요 예측 및 대여소 안내 서비스")
+with st.container(key="title_box"):
+    st.title("🚲 AI 기반 따릉이 출퇴근 수요 예측 및 대여소 안내 서비스")
 st.caption(
     # [수정 2026-11-17] 소개 문구를 이용자 말로
     "고른 날짜의 출퇴근 시간에 대여소마다 자전거가 남을지 모자랄지 예측하고, 대여소 유형 지도, "
@@ -112,6 +114,39 @@ st.caption(
 st.markdown(
     """
     <style>
+    .st-key-title_box {
+        background: linear-gradient(-45deg, #fff1eb, #fce4ec, #e3f2fd, #e0f2f1);
+        background-size: 400% 400%;
+        animation: gradient 10s ease infinite;
+        height: 100vh;
+        padding: 15px 25px;
+        border-radius: 12px;
+        border: 1px solid #e0e0e0;
+    }
+    @keyframes gradient {
+        0% {
+            background-position: 0% 50%;
+        }
+        50% {
+            background-position: 100% 50%;
+        }
+        100% {
+            background-position: 0% 50%;
+        }
+    }
+    [class*="st-key-subheader_box_"] {
+        background: linear-gradient(135deg, #f0fdfa 0%, #ccfbf1 50%, #cffafe 100%);
+        padding: 15px;
+        border-radius: 12px;
+        border: 1px solid #e0e0e0;
+    }
+    [data-testid="stHeading"] h1 {
+        font-size: 2.25rem;
+        text-align: center;
+    }
+    [data-testid="stHeading"] h3 {
+        font-size: 1.5rem;
+    }
     [data-testid="stSidebarHeader"] {
         position: absolute !important;
         top: calc(0.75rem + 20px) !important;
@@ -125,12 +160,19 @@ st.markdown(
     }
     [data-testid="stSidebarUserContent"] {
         padding-top: calc(0.75rem + 20px) !important;
+        padding-bottom: 0.5rem !important;
+    }
+    .stat { 
+        font-size: 1.2rem;
+        padding: 10px;
+        border-radius: 12px;
+        border: 1px solid #e0e0e0;
     }
     .stat-row {
         display: grid;
-        grid-template-columns: repeat(3, 6.5rem);
-        column-gap: 0.25rem;
-        justify-content: end;
+        grid-template-columns: repeat(3, 7.5rem);
+        column-gap: 0.5rem;
+        justify-content: start;
         align-items: start;
     }
     .stat-label { font-size: 0.75rem; opacity: 0.75; white-space: nowrap; }
@@ -159,6 +201,19 @@ st.markdown(
         white-space: nowrap;
         margin: 0.25rem 0;
     }
+    /* 사이드바 입력 상자: 번짐 없는 단색 그림자(0 3px 0 0)를 아래쪽에만 깔아 '아래 테두리'처럼 보이게 한다.
+       드롭다운은 react-aria 구조라서 .react-aria-ComboBox 안의 role="group" 상자가 테두리 상자다.
+       본문(메인 화면)의 드롭다운에는 적용되지 않도록 사이드바 안으로 범위를 좁혔다. */
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] .react-aria-ComboBox > [role="group"] {
+        background-color: #fff;
+    }
+    /* 날짜 상자: 구조를 직접 확인하지 못해 추정한 선택자 (아래 세 가지 중 맞는 것이 적용된다) */
+    [data-testid="stSidebar"] [data-testid="stDateInputField"] {
+        background-color: #fff;
+    }
+    [data-testid="stSidebar"] [data-testid="stNumberInputContainer"] {
+        background-color: #fff;
+    }
     [data-testid="stSidebarUserContent"] hr {
         margin: 1rem 0 !important;
     }
@@ -171,6 +226,15 @@ st.markdown(
         margin: 0 !important;
         padding: 0 3rem 0 0 !important;
         white-space: nowrap;
+    }
+    [data-testid="stSelectboxVirtualDropdown"] {
+        background-color: #fff;
+    }
+    [data-testid="stTextInputRootElement"] {
+        background-color: #fff;
+    }
+    .react-aria-ComboBox > [role="group"] {
+        background-color: #fff;
     }
     </style>
     """,
@@ -1059,7 +1123,7 @@ def hourly_totals(daily, station_id=None):
 #        같은 요일 재생(비교용)·모델 고르기는 일반 이용자가 몰라도 되므로 고급 설정 안에 둔다.
 st.sidebar.header("🚲 무엇을 볼까요?")
 mode = st.sidebar.radio(
-    "메뉴 선택",
+    "📋 메뉴 선택",
     [
         # [수정 2026-11-17] 예측 화면임이 이름에 드러나게(사용자 결정)
         MENU1,   # [수정 2026-11-17] 실시간 아님(예측) + 전문 용어 제거
@@ -1078,7 +1142,7 @@ sb_weather = st.sidebar.container()   # 날씨 자동 반영·날씨 고치기·
 sb_adv = st.sidebar.expander("⚙️ 고급 설정 (예측 방식·모델)", expanded=False)
 # [역할] 예측 방식 선택. [원리] C안은 고른 날짜를 실제로 예측하고, 기존 방식은 같은 요일 과거 하루를 1시간 모델로 재생한다.
 method = sb_adv.radio(
-    "예측 방식", [METHOD_LT, METHOD_REPLAY],
+    "📈 예측 방식", [METHOD_LT, METHOD_REPLAY],
     # [수정 2026-11-17] 도움말을 이용자 말로
     help="날짜 예측(추천): 작년 같은 시기 기록과 그날 날씨로 고른 날짜를 예측합니다.\n\n"
          "같은 요일 재생(비교용): 고른 날짜와 같은 요일의 지난 실제 하루를 다시 계산해 보는 시뮬레이션입니다.",
@@ -1091,11 +1155,11 @@ lt_model = "LightGBM"
 if use_lt:
     lt_models = ["LightGBM"] if lt_missing else lc.available_models(LT_MODEL_DIR)
     # [수정 2026-11-17] 선택지는 내부 이름(LightGBM 등) 그대로 두고, 화면에는 이용자용 이름으로 보여 준다(format_func).
-    lt_model = sb_adv.selectbox("예측 모델 선택", lt_models, key="lt_model_pick",
+    lt_model = sb_adv.selectbox("🤖 예측 모델 선택", lt_models, key="lt_model_pick",
                                     format_func=lt_name, help=LT_MODEL_HELP)
     model_type = lt_name(lt_model, star=False)   # 화면 제목·지도 key에 표시되는 이름 (기존 모델 경로에서는 쓰이지 않음)
 else:
-    model_type = sb_adv.selectbox("예측 모델 선택", MODEL_OPTIONS, index=MODEL_OPTIONS.index("LightGBM"),
+    model_type = sb_adv.selectbox("🤖 예측 모델 선택", MODEL_OPTIONS, index=MODEL_OPTIONS.index("LightGBM"),
                                       help="같은 요일 재생에 쓰는 1시간 예측 모델입니다.")
 # [추가 2026-11-17] 화면 제목용 이름: 날짜 예측은 '추천 예측 (LightGBM)'처럼 그대로, 같은 요일 재생은 'LightGBM 모델'.
 model_title = model_type if use_lt else f"{model_type} 모델"
@@ -1119,16 +1183,16 @@ if use_lt:
     elif (lt_last - today).days < 14:
         sb_basic.warning(f"⏳ 날짜 예측은 {lt_last:%m/%d}까지만 할 수 있어요(2025년 기록 기준). "
                            f"그 뒤 날짜는 고를 수 없습니다.")
-    selected_date = sb_basic.date_input(f"날짜 선택 (오늘부터 {LT_DAYS_AHEAD}일 이내)", value=today,
+    selected_date = sb_basic.date_input(f"☀️ 날짜 선택 (오늘부터 {LT_DAYS_AHEAD}일 이내)", value=today,
                                           min_value=today, max_value=lt_max)
 else:
     selected_date = sb_basic.date_input(
-        "날짜 선택 (오늘 이후)",
+        "☀️ 날짜 선택 (오늘 이후)",
         value=today,
         min_value=today,
         max_value=today + dt.timedelta(days=MAX_DAYS_AHEAD),
     )
-period_label = sb_basic.selectbox("출퇴근 시간대 선택", list(PERIOD_OPTIONS))
+period_label = sb_basic.selectbox("⏰ 출퇴근 시간대 선택", list(PERIOD_OPTIONS))
 selected_station_id = sidebar_station_picker(disabled=mode.startswith("4."), where=sb_basic)
 
 # [역할] 날씨 입력(C안 전용). [원리] ① 기상청 예보가 있으면 그 값을 기본값으로 채운다(단기예보 우선, 없으면 중기예보).
@@ -1152,13 +1216,13 @@ if use_lt and not lt_missing:
     wx_info = sb_weather.container()   # [수정 2026-11-17] 자동 반영 상자를 '날씨 고치기' 메뉴보다 위에 보이게 하는 칸
     with sb_weather.expander(title.replace("🌦️ 날씨", "✏️ 날씨 고치기"), expanded=False):
         # [수정 2026-11-16] 기온은 소수점 첫째 자리까지만 입력·표시(기상청 예보·학습 자료도 0.1℃ 단위). +/- 버튼은 0.1℃씩.
-        t_min = st.number_input("최저기온 (℃)", value=round(float(d_tmin), 1), step=0.1, format="%.1f", key=f"lt_tmin_{tag}")
-        t_max = st.number_input("최고기온 (℃)", value=round(float(d_tmax), 1), step=0.1, format="%.1f", key=f"lt_tmax_{tag}")
-        am = st.selectbox("오전 강수", range(4), index=int(d_am), format_func=lambda i: lc.PRECIP_LABELS[i], key=f"lt_am_{tag}")
-        pm = st.selectbox("오후 강수", range(4), index=int(d_pm), format_func=lambda i: lc.PRECIP_LABELS[i], key=f"lt_pm_{tag}")
+        t_min = st.number_input("🧊 최저기온 (℃)", value=round(float(d_tmin), 1), step=0.1, format="%.1f", key=f"lt_tmin_{tag}")
+        t_max = st.number_input("🔥 최고기온 (℃)", value=round(float(d_tmax), 1), step=0.1, format="%.1f", key=f"lt_tmax_{tag}")
+        am = st.selectbox("🌅 오전 강수", range(4), index=int(d_am), format_func=lambda i: lc.PRECIP_LABELS[i], key=f"lt_am_{tag}")
+        pm = st.selectbox("🌇 오후 강수", range(4), index=int(d_pm), format_func=lambda i: lc.PRECIP_LABELS[i], key=f"lt_pm_{tag}")
         # [추가 2026-11-16 눈] 강수 형태. [원리] '눈'을 고르면 기온과 관계없이 눈으로 예측한다(강수량이 '없음'이면 약한 눈으로 처리).
         #        '비'면 학습 때 규칙대로 최저기온 0℃ 이하일 때만 눈으로 추정한다. 기상청이 눈을 예보하면 '눈'이 기본값.
-        snow = st.selectbox("강수 형태", [0, 1], index=d_is_snow, key=f"lt_snow_{tag}",
+        snow = st.selectbox("❄️ 강수 형태", [0, 1], index=d_is_snow, key=f"lt_snow_{tag}",
                             format_func=lambda i: "눈" if i else "비 (최저기온 0℃ 이하면 눈으로 자동 판단)")
         if fc:
             st.caption(f"출처: {src}. 값을 고치면 고친 값으로 예측합니다. 모델은 실제 날씨로 학습되어, 예보가 틀리면 예측도 틀릴 수 있습니다.")
@@ -1586,7 +1650,8 @@ if mode == MENU1:   # [수정 2026-11-17] 출퇴근 예보 시도 후 사용자 
     df_predicted, info = get_predictions()
     window_text = f"{day_text(selected_date)} {period_label} ({info['hour_min']:02d}~{info['hour_max']:02d}시)"
     # [수정 2026-11-17] Net-flow 등 전문 용어를 쉬운 말로, 모델 이름은 끝 괄호로
-    st.subheader(f"📊 {window_text} 대여소별 자전거 남음·부족 예측 · {model_title}")
+    with st.container(key="subheader_box_1"):
+        st.subheader(f"📊 {window_text} 대여소별 자전거 남음·부족 예측 · {model_title}")
 
     shortage_cnt = len(df_predicted[df_predicted["위험상태"].str.contains("부족")])
     overflow_cnt = len(df_predicted[df_predicted["위험상태"].str.contains("포화")])
@@ -1688,7 +1753,7 @@ if mode == MENU1:   # [수정 2026-11-17] 출퇴근 예보 시도 후 사용자 
         #        GPS 대신 주소를 쓰는 이유: 위치 권한 팝업·PC 위치 부정확·새 부품 설치 없이 동작한다.
         #        대상이 60곳뿐이라 가까운 곳이 멀 수 있어, 2km 안에 없으면 그렇다고 알려 준다.
         sort_by = st.segmented_control("표 정렬", ["모자란 순", "가까운 순", "이름순"], default="모자란 순",
-                                       key="sort_m1", help="모자란 순: '자전거 부족 예상' 대여소를 맨 위에, 그다음 자전거가 많이 빠져나가는 순")
+                                    key="sort_m1", help="모자란 순: '자전거 부족 예상' 대여소를 맨 위에, 그다음 자전거가 많이 빠져나가는 순")
         if sort_by == "가까운 순":
             base = nearest_sort(base)
             if "거리_m" in base.columns:
@@ -1706,11 +1771,11 @@ if mode == MENU1:   # [수정 2026-11-17] 출퇴근 예보 시도 후 사용자 
         # [수정 2026-11-17] 열 이름을 쉬운 말로, 숫자는 그대로 두고 '+/−대' 형식으로 표시(머리글 정렬 유지)
         net_col, act_col = "증감 (+남음/−모자람)", "참조일 실제 증감"
         table = table.rename(columns={"대여소명": "대여소", "순수요_NetFlow": net_col,
-                                      "실제_NetFlow": act_col, "위험상태": "상태", "거리_m": "거리(직선)"})
+                                    "실제_NetFlow": act_col, "위험상태": "상태", "거리_m": "거리(직선)"})
         st.dataframe(one_based(table), width="stretch", height=400, column_config={
             "거리(직선)": st.column_config.NumberColumn(format="%.0fm", help="고른 위치에서 대여소까지 직선거리(실제 길은 더 길어요)"),
             net_col: st.column_config.NumberColumn(format="%+.1f대",
-                                                   help="시간대 동안 (예측 반납 − 예측 대여). +면 자전거가 남고, −면 모자랍니다."),
+                                                help="시간대 동안 (예측 반납 − 예측 대여). +면 자전거가 남고, −면 모자랍니다."),
             act_col: st.column_config.NumberColumn(format="%+.1f대"),
         })
         st.caption("증감: 이 시간대에 들어오는 자전거(반납)에서 나가는 자전거(대여)를 뺀 값이에요.")
@@ -1731,7 +1796,8 @@ if mode == MENU1:   # [수정 2026-11-17] 출퇴근 예보 시도 후 사용자 
 elif mode == "2. 대여소 유형 지도 (출퇴근 흐름별)":
     df_predicted, info = get_predictions()
     types, tmeta = load_station_types()
-    st.subheader("🧭 대여소 유형 지도 (출퇴근 흐름별) — 비슷하게 움직이는 대여소끼리 묶었어요")
+    with st.container(key="subheader_box_2"):
+        st.subheader("🧭 대여소 유형 지도 (출퇴근 흐름별) — 비슷하게 움직이는 대여소끼리 묶었어요")
     if types is None:
         st.error("대여소 유형 파일(data/station_types.csv)이 없습니다. "
                  "`.venv\\Scripts\\python.exe scripts\\build_station_types.py`를 실행해 만들어 주세요.")
@@ -1932,7 +1998,8 @@ elif mode == "2. 대여소 유형 지도 (출퇴근 흐름별)":
 elif mode == MENU5:
     df_predicted, info = get_predictions()
     types, tmeta = load_station_types()
-    st.subheader("🚚 재배치 도우미 — 따릉이 재배치 담당자를 위한 화면")
+    with st.container(key="subheader_box_5"):
+        st.subheader("🚚 재배치 도우미 — 따릉이 재배치 담당자를 위한 화면")
     st.caption("어느 구·유형에서 자전거가 모자라거나 남는지, 어디서 어디로 옮기면 좋을지, 자전거가 어디로 흐르는지 볼 수 있어요. "
                "재배치 담당자를 위한 화면이지만 누구나 볼 수 있어요.")
     if types is None:
@@ -2023,7 +2090,8 @@ elif mode == "3. 시간대별 대여·반납 예측 그래프":
             st.stop()
 
     weekday = WEEKDAYS[selected_date.weekday()]
-    st.subheader(f"📈 {day_text(selected_date)} 시간대별 예측 대여·반납 대수 · {model_title}")
+    with st.container(key="subheader_box_3"):
+        st.subheader(f"📈 {day_text(selected_date)} 시간대별 예측 대여·반납 대수 · {model_title}")
 
     picked_id = selected_station_id
     if picked_id is not None and not (daily["대여소ID"] == picked_id).any():
@@ -2058,7 +2126,8 @@ elif mode == "4. 가까운 대여소 길찾기":
         st.stop()
 
     stations = load_station_locations()
-    st.subheader("🧭 출발지 근처에서 빌려 도착지 근처에 반납하기")
+    with st.container(key="subheader_box_4"):
+        st.subheader("🧭 출발지 근처에서 빌려 도착지 근처에 반납하기")
     st.caption(
         "출발지·도착지를 장소 이름이나 주소로 검색하면 각각 가장 가까운 대여소를 찾고, "
         "대여소 사이 **자전거 탑승 예상 시간**을 보여 줍니다. 대상 대여소는 분석용 60곳입니다."
