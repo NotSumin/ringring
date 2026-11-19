@@ -187,7 +187,7 @@
 
 ```
 # 1. 저장소 받기
-git clone <저장소 URL>
+git clone https://github.com/sun111902ringring/ringring.git
 cd ringring
 
 # 2. 가상환경 생성 및 활성화
