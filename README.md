@@ -38,7 +38,7 @@
 
 ## 2. 서비스 화면
 
-![첫 화면](docs/changes_20261117/img/after_1_first.jpg)
+![첫 화면](<img width="1890" height="993" alt="Screenshot 2026-11-20 153524" src="https://github.com/user-attachments/assets/9f64e292-fc4b-48d1-82dc-0d5d301bb242" />)
 
 사이드바에서 **메뉴 → 날짜(오늘부터 7일 이내) → 출근/퇴근 → 대여소**를 고릅니다. 날씨는 **기상청 단기·중기예보가 자동으로 들어가고**, 직접 고칠 수도 있습니다.
 
